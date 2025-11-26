@@ -1832,20 +1832,31 @@ function Test-SSHConnection {
             return $true
         }
         
-        # Test SSH connection with timeout
-        $sshCommand = "ssh -p $($Config.SSHPort) -o ConnectTimeout=10 -o StrictHostKeyChecking=no $($Config.SSHUser)@$($Config.SSHHost) 'echo CONNECTION_OK'"
-        Write-Log "Executing: $sshCommand" -Level Info
+        # Test SSH connection with timeout using Start-Process
+        $sshArgs = @("-p", "$($Config.SSHPort)", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "$($Config.SSHUser)@$($Config.SSHHost)", "echo CONNECTION_OK")
+        Write-Log "Executing: ssh $($sshArgs -join ' ')" -Level Info
         
-        $result = Invoke-Expression $sshCommand 2>&1
+        $tempOutput = [System.IO.Path]::GetTempFileName()
+        $tempError = [System.IO.Path]::GetTempFileName()
         
-        if ($LASTEXITCODE -eq 0 -and $result -match "CONNECTION_OK") {
-            $duration = (Get-Date) - $stepStart
-            Write-Log "SSH connection successful (Duration: $($duration.TotalSeconds.ToString('F2'))s)" -Level Success
-            return $true
+        try {
+            $sshProcess = Start-Process -FilePath "ssh" -ArgumentList $sshArgs -Wait -NoNewWindow -PassThru -RedirectStandardOutput $tempOutput -RedirectStandardError $tempError
+            $result = if (Test-Path $tempOutput) { Get-Content $tempOutput -Raw } else { "" }
+            $errorOutput = if (Test-Path $tempError) { Get-Content $tempError -Raw } else { "" }
+            
+            if ($sshProcess.ExitCode -eq 0 -and $result -match "CONNECTION_OK") {
+                $duration = (Get-Date) - $stepStart
+                Write-Log "SSH connection successful (Duration: $($duration.TotalSeconds.ToString('F2'))s)" -Level Success
+                return $true
+            }
+            else {
+                Write-Log "SSH connection failed. Exit code: $($sshProcess.ExitCode), Output: $result, Error: $errorOutput" -Level Error
+                return $false
+            }
         }
-        else {
-            Write-Log "SSH connection failed. Exit code: $LASTEXITCODE, Output: $result" -Level Error
-            return $false
+        finally {
+            if (Test-Path $tempOutput) { Remove-Item $tempOutput -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $tempError) { Remove-Item $tempError -Force -ErrorAction SilentlyContinue }
         }
     }
     catch {
