@@ -1966,49 +1966,124 @@ function Get-BackupArchive {
         }
         
         # Build tar command based on path type
+        # Using -v for verbose output to show files being backed up
         if ($hasWildcard) {
             # For wildcard paths, tar the glob pattern directly (shell expands it)
-            $tarCommand = "tar -czf - --ignore-failed-read $($Config.RemotePath) 2>/dev/null"
+            $tarCommand = "tar -cvzf - --ignore-failed-read $($Config.RemotePath) 2>&1"
         }
         else {
             # For single path, cd into directory and tar current dir
-            $tarCommand = "cd '$($Config.RemotePath)' && tar -czf - . 2>/dev/null"
+            $tarCommand = "cd '$($Config.RemotePath)' && tar -cvzf - . 2>&1"
         }
         
         Write-Log "Streaming backup via SSH (no server-side archive created)..." -Level Info
         Write-Log "Remote command: $tarCommand" -Level Info
         
-        # Stream tar output directly through SSH to local file
-        # Using Start-Process to avoid PowerShell interpreting redirections
-        $sshArgs = @("-p", "$($Config.SSHPort)", "$($Config.SSHUser)@$($Config.SSHHost)", $tarCommand)
-        $errorFile = [System.IO.Path]::GetTempFileName()
-        
-        Write-Log "Starting backup stream (this may take a while for large backups)..." -Level Info
+        Write-Log "Starting backup stream with verbose output..." -Level Info
         Write-Host ""
         
-        try {
-            $streamProcess = Start-Process -FilePath "ssh" `
-                -ArgumentList $sshArgs `
-                -Wait -NoNewWindow -PassThru `
-                -RedirectStandardOutput $localPath `
-                -RedirectStandardError $errorFile
-            
-            if ($streamProcess.ExitCode -ne 0) {
-                $stderr = if (Test-Path $errorFile) { Get-Content $errorFile -Raw } else { "" }
-                # tar with --ignore-failed-read may return exit code 1 for minor issues, check if file was created
-                if (-not (Test-Path $localPath) -or (Get-Item $localPath).Length -eq 0) {
-                    throw "Failed to stream backup via SSH. Exit code: $($streamProcess.ExitCode), Error: $stderr"
+        # Use .NET Process class for real-time stderr output while capturing stdout to file
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = "ssh"
+        $processInfo.Arguments = "-p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) `"$tarCommand`""
+        $processInfo.UseShellExecute = $false
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $processInfo.CreateNoWindow = $true
+        
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processInfo
+        
+        # Track progress
+        $fileCount = 0
+        $lastReportTime = Get-Date
+        $startTime = Get-Date
+        
+        # Event handler for stderr (verbose output showing files)
+        $stderrHandler = {
+            if (-not [string]::IsNullOrEmpty($EventArgs.Data)) {
+                $line = $EventArgs.Data
+                # Skip tar info messages, show actual file paths
+                if ($line -notmatch "^tar:" -and $line.Trim() -ne "") {
+                    $script:fileCount++
+                    # Show every file or periodically show progress
+                    $elapsed = (Get-Date) - $script:startTime
+                    $elapsedStr = "{0:mm\:ss}" -f $elapsed
+                    
+                    # Truncate long paths for display
+                    $displayPath = if ($line.Length -gt 80) { "..." + $line.Substring($line.Length - 77) } else { $line }
+                    Write-Host "`r  [$elapsedStr] Files: $($script:fileCount) | $displayPath".PadRight(120) -NoNewline -ForegroundColor Cyan
                 }
-                else {
-                    Write-Log "Tar completed with warnings (exit code $($streamProcess.ExitCode)). Continuing..." -Level Warning
+                elseif ($line -match "^tar:") {
+                    # Show tar warnings/info
+                    Write-Host ""
+                    Write-Host "  $line" -ForegroundColor Yellow
                 }
             }
         }
-        finally {
-            if (Test-Path $errorFile) { Remove-Item $errorFile -Force -ErrorAction SilentlyContinue }
-        }
         
-        Write-Host ""
+        # Register event handlers
+        $stdErrEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action $stderrHandler
+        
+        try {
+            # Start the process
+            $process.Start() | Out-Null
+            $process.BeginErrorReadLine()
+            
+            # Read stdout (tar data) and write to file
+            $outputStream = [System.IO.File]::Create($localPath)
+            try {
+                $buffer = New-Object byte[] 65536
+                $stdoutStream = $process.StandardOutput.BaseStream
+                
+                while ($true) {
+                    $bytesRead = $stdoutStream.Read($buffer, 0, $buffer.Length)
+                    if ($bytesRead -eq 0) { break }
+                    $outputStream.Write($buffer, 0, $bytesRead)
+                    
+                    # Periodically show file size progress
+                    $now = Get-Date
+                    if (($now - $lastReportTime).TotalSeconds -ge 5) {
+                        $currentSize = $outputStream.Length
+                        $sizeMB = [math]::Round($currentSize / 1MB, 1)
+                        $elapsed = $now - $startTime
+                        $elapsedStr = "{0:mm\:ss}" -f $elapsed
+                        Write-Host ""
+                        Write-Host "  [$elapsedStr] Archive size: ${sizeMB} MB | Files processed: $fileCount" -ForegroundColor Green
+                        $lastReportTime = $now
+                    }
+                }
+            }
+            finally {
+                $outputStream.Close()
+            }
+            
+            $process.WaitForExit()
+            $exitCode = $process.ExitCode
+            
+            Write-Host ""
+            Write-Host ""
+            
+            if ($exitCode -ne 0) {
+                # tar with --ignore-failed-read may return exit code 1 for minor issues
+                if (-not (Test-Path $localPath) -or (Get-Item $localPath).Length -eq 0) {
+                    throw "Failed to stream backup via SSH. Exit code: $exitCode"
+                }
+                else {
+                    Write-Log "Tar completed with warnings (exit code $exitCode). Continuing..." -Level Warning
+                }
+            }
+            
+            Write-Log "Processed $fileCount files/directories" -Level Info
+        }
+        finally {
+            Unregister-Event -SourceIdentifier $stdErrEvent.Name -ErrorAction SilentlyContinue
+            Remove-Job -Id $stdErrEvent.Id -Force -ErrorAction SilentlyContinue
+            if ($process -and -not $process.HasExited) {
+                $process.Kill()
+            }
+            $process.Dispose()
+        }
         
         # Verify the backup was created
         if (-not (Test-Path $localPath)) {
