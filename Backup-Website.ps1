@@ -1314,72 +1314,17 @@ function Invoke-InteractiveSetup {
     Start-Sleep -Seconds 1
     
     # STEP 4: Determine Backup Paths
-    Show-ProgressStep -Step 4 -TotalSteps 8 -Description "Website Location Discovery"
+    Show-ProgressStep -Step 4 -TotalSteps 8 -Description "Website Location"
     
-    Write-ColorMessage "Searching for common website directories on your server..." -Type Info
+    Write-ColorMessage "Please enter the path to your website files on the server." -Type Info
+    Write-Host ""
+    Write-ColorMessage "Common examples:" -Type Info
+    Write-Host "  - /home/username/public_html" -ForegroundColor Yellow
+    Write-Host "  - /home/username/applications/myapp/public_html" -ForegroundColor Yellow
+    Write-Host "  - /var/www/html" -ForegroundColor Yellow
     Write-Host ""
     
-    # Try to discover directories
-    $homePath = "/home/$sshUser/"
-    $applicationsPath = "$homePath" + "applications/"
-    
-    $discoveredDirs = @()
-    
-    # Check /home/username/applications/
-    Write-Host "  Checking $applicationsPath... " -NoNewline
-    $appDirs = Get-RemoteDirectories -User $sshUser -Hostname $sshHost -Port $sshPort -BasePath $applicationsPath
-    if ($appDirs.Count -gt 0) {
-        Write-ColorMessage "Found $($appDirs.Count) directories" -Type Success
-        $discoveredDirs += $appDirs
-    }
-    else {
-        Write-ColorMessage "No directories found" -Type Warning
-    }
-    
-    # Check /var/www/ if we have access
-    Write-Host "  Checking /var/www/... " -NoNewline
-    if (Test-RemotePathExists -User $sshUser -Hostname $sshHost -Port $sshPort -Path "/var/www") {
-        $wwwDirs = Get-RemoteDirectories -User $sshUser -Hostname $sshHost -Port $sshPort -BasePath "/var/www/"
-        if ($wwwDirs.Count -gt 0) {
-            Write-ColorMessage "Found $($wwwDirs.Count) directories" -Type Success
-            $discoveredDirs += $wwwDirs
-        }
-        else {
-            Write-ColorMessage "No directories found" -Type Warning
-        }
-    }
-    else {
-        Write-ColorMessage "Not accessible" -Type Warning
-    }
-    
-    Write-Host ""
-    
-    # Present options to user
-    if ($discoveredDirs.Count -gt 0) {
-        Write-ColorMessage "Discovered directories:" -Type Info
-        for ($i = 0; $i -lt $discoveredDirs.Count -and $i -lt 10; $i++) {
-            Write-Host "  [$($i + 1)] $($discoveredDirs[$i])" -ForegroundColor Yellow
-        }
-        Write-Host "  [C] Enter custom path" -ForegroundColor Yellow
-        Write-Host ""
-        
-        $choice = Read-UserInput -Prompt "Select a directory (1-$($discoveredDirs.Count)) or C for custom" -Required
-        
-        if ($choice -eq 'C' -or $choice -eq 'c') {
-            $remotePath = Read-UserInput -Prompt "Enter the full path to your website files" -Required
-        }
-        elseif ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $discoveredDirs.Count) {
-            $remotePath = $discoveredDirs[[int]$choice - 1]
-        }
-        else {
-            Write-ColorMessage "Invalid selection. Using first discovered directory." -Type Warning
-            $remotePath = $discoveredDirs[0]
-        }
-    }
-    else {
-        Write-ColorMessage "No directories auto-discovered." -Type Warning
-        $remotePath = Read-UserInput -Prompt "Enter the full path to your website files (e.g., /home/user/public_html)" -Required
-    }
+    $remotePath = Read-UserInput -Prompt "Enter the full path to your website files" -Required
     
     # Verify the path exists
     Write-Host ""
