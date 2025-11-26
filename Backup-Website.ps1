@@ -1870,9 +1870,28 @@ function Test-Prerequisites {
     
     # Check SSH
     try {
-        $sshCheck = Get-Command ssh -ErrorAction Stop
-        $sshVersion = ssh -V 2>&1
-        Write-Log "SSH client found: $($sshCheck.Source)" -Level Success
+        $sshCheck = Get-Command ssh -ErrorAction SilentlyContinue
+        if (-not $sshCheck) {
+            # Try common locations
+            $commonPaths = @(
+                "$env:SystemRoot\System32\OpenSSH\ssh.exe",
+                "$env:ProgramFiles\OpenSSH\ssh.exe",
+                "$env:ProgramFiles(x86)\OpenSSH\ssh.exe"
+            )
+            foreach ($path in $commonPaths) {
+                if (Test-Path $path) {
+                    $sshCheck = Get-Item $path
+                    break
+                }
+            }
+        }
+        if ($sshCheck) {
+            $sshPath = if ($sshCheck.Source) { $sshCheck.Source } else { $sshCheck.FullName }
+            Write-Log "SSH client found: $sshPath" -Level Success
+        }
+        else {
+            throw "SSH not found"
+        }
     }
     catch {
         Write-Log "SSH client not found. Please install OpenSSH client." -Level Error
@@ -1952,18 +1971,35 @@ function New-BackupArchive {
         if ($hasWildcard) {
             # For wildcard paths, use tar with the glob pattern directly
             # The shell will expand the wildcard to all matching directories
-            $tarCommand = "tar -czf '$tempBackupPath' --ignore-failed-read $($Config.RemotePath) 2>/dev/null"
+            # Using -v for verbose output to show files being added
+            $tarCommand = "tar -cvzf '$tempBackupPath' --ignore-failed-read $($Config.RemotePath) 2>&1"
         }
         else {
             # For single path, cd into directory and tar current dir (excluding backup file)
-            $tarCommand = "cd '$($Config.RemotePath)' && tar -czf '$tempBackupPath' --exclude='$backupFileName' ."
+            # Using -v for verbose output to show files being added
+            $tarCommand = "cd '$($Config.RemotePath)' && tar -cvzf '$tempBackupPath' --exclude='$backupFileName' . 2>&1"
         }
         
         $sshCommand = "ssh -p $($Config.SSHPort) $($Config.SSHUser)@$($Config.SSHHost) `"$tarCommand`""
         
         Write-Log "Executing: $sshCommand" -Level Info
+        Write-Log "Tar verbose output:" -Level Info
         
         $result = Invoke-Expression $sshCommand 2>&1
+        
+        # Log the verbose output from tar
+        if ($result) {
+            $lines = $result -split "`n"
+            $fileCount = 0
+            foreach ($line in $lines) {
+                $line = $line.Trim()
+                if ($line) {
+                    Write-Log "  $line" -Level Info
+                    $fileCount++
+                }
+            }
+            Write-Log "Total files/directories processed: $fileCount" -Level Info
+        }
         
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to create remote archive. Exit code: $LASTEXITCODE, Output: $result"
@@ -2526,6 +2562,8 @@ Please check the log file for error details.
         exit 0
     }
     else {
+        Write-Host ""
+        Read-Host "Press Enter to exit"
         exit 1
     }
 }
@@ -2675,6 +2713,8 @@ try {
 }
 catch {
     Write-ColorMessage "Fatal error: $_" -Type Error
+    Write-Host ""
+    Read-Host "Press Enter to exit"
     exit 1
 }
 
