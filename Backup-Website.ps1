@@ -1952,6 +1952,27 @@ function Test-Prerequisites {
 # BACKUP FUNCTIONS
 # =============================================================================
 
+function Get-FileChecksum {
+    <#
+    .SYNOPSIS
+        Calculates SHA256 checksum for a file.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath
+    )
+    
+    try {
+        $hash = Get-FileHash -Path $FilePath -Algorithm SHA256
+        return $hash.Hash
+    }
+    catch {
+        Write-Log "Failed to calculate checksum for $FilePath : $_" -Level Error
+        return $null
+    }
+}
+
 function Get-BackupArchive {
     <#
     .SYNOPSIS
@@ -2213,12 +2234,14 @@ function Get-BackupArchive {
             $process.Dispose()
         }
         
-        # Verify all backup parts were created
-        Write-Log "Verifying local backup files..." -Level Info
+        # Verify all backup parts were created and calculate checksums
+        Write-Log "Verifying local backup files and calculating checksums..." -Level Info
         Write-Log "Total parts created: $($script:backupParts.Count)" -Level Info
         
         $totalSizeBytes = 0
         $partNumber = 0
+        $checksums = @{}
+        
         foreach ($partPath in $script:backupParts) {
             $partNumber++
             if (-not (Test-Path $partPath)) {
@@ -2232,8 +2255,20 @@ function Get-BackupArchive {
             $partDisplay = if ($partSizeGB -ge 1) { "$partSizeGB GB" } else { "$partSizeMB MB" }
             $totalSizeBytes += $partSizeBytes
             
-            Write-Log "Part $partNumber : $(Split-Path -Leaf $partPath) - $partDisplay" -Level Info
+            # Calculate checksum for this part
+            Write-Log "Calculating SHA256 checksum for part $partNumber..." -Level Info
+            $partName = Split-Path -Leaf $partPath
+            $checksum = Get-FileChecksum -FilePath $partPath
+            if ($checksum) {
+                $checksums[$partName] = $checksum
+                Write-Log "Part $partNumber : $(Split-Path -Leaf $partPath) - $partDisplay - SHA256: $checksum" -Level Info
+            } else {
+                Write-Log "WARNING: Failed to calculate checksum for part $partNumber" -Level Warning
+            }
         }
+        
+        # Store checksums for later use
+        $script:backupChecksums = $checksums
         
         $totalSizeMB = [math]::Round($totalSizeBytes / 1MB, 2)
         $totalSizeGB = [math]::Round($totalSizeBytes / 1GB, 2)
@@ -2277,7 +2312,7 @@ function Get-BackupArchive {
 function Publish-ToGoogleDrive {
     <#
     .SYNOPSIS
-        Uploads the backup archive parts to Google Drive using rclone.
+        Uploads the backup archive parts to Google Drive using rclone with checksum verification.
     #>
     [CmdletBinding()]
     param(
@@ -2285,7 +2320,10 @@ function Publish-ToGoogleDrive {
         [string[]]$LocalPaths,
         
         [Parameter(Mandatory=$true)]
-        [hashtable]$Config
+        [hashtable]$Config,
+        
+        [Parameter(Mandatory=$false)]
+        [hashtable]$Checksums
     )
     
     Write-StepHeader "Uploading to Google Drive"
@@ -2344,8 +2382,21 @@ function Publish-ToGoogleDrive {
             Write-Host ""
             Write-Host "  [$uploadedParts/$totalParts] Uploading: $partName ($partSizeDisplay)" -ForegroundColor Cyan
             
-            # Upload using rclone with progress and retry logic
-            $rcloneCommand = "rclone copy `"$partPath`" `"$($Config.GDriveRemote)`" --progress --stats 5s --verbose"
+            # Calculate checksum before upload if not provided
+            $partChecksum = $null
+            if ($Checksums -and $Checksums.ContainsKey($partName)) {
+                $partChecksum = $Checksums[$partName]
+                Write-Log "Using pre-calculated checksum for part ${uploadedParts}: $partChecksum" -Level Info
+            } else {
+                Write-Log "Calculating checksum for part $uploadedParts..." -Level Info
+                $partChecksum = Get-FileChecksum -FilePath $partPath
+                if ($partChecksum) {
+                    Write-Log "Part $uploadedParts SHA256: $partChecksum" -Level Info
+                }
+            }
+            
+            # Upload using rclone with checksum verification, progress and retry logic
+            $rcloneCommand = "rclone copy `"$partPath`" `"$($Config.GDriveRemote)`" --checksum --progress --stats 5s --verbose"
             Write-Log "Command: $rcloneCommand" -Level Info
             
             $maxRetries = 3
@@ -2367,7 +2418,7 @@ function Publish-ToGoogleDrive {
                     $stderr = $null
                     
                     $process = Start-Process -FilePath "rclone" `
-                        -ArgumentList @("copy", "`"$partPath`"", "`"$($Config.GDriveRemote)`"", "--progress", "--stats", "5s", "--verbose") `
+                        -ArgumentList @("copy", "`"$partPath`"", "`"$($Config.GDriveRemote)`"", "--checksum", "--progress", "--stats", "5s", "--verbose") `
                         -Wait -NoNewWindow -PassThru `
                         -RedirectStandardOutput "rclone_stdout_$uploadedParts.tmp" `
                         -RedirectStandardError "rclone_stderr_$uploadedParts.tmp"
@@ -2454,42 +2505,58 @@ function Publish-ToGoogleDrive {
             $partSpeedMBps = [math]::Round($partSizeBytes / $partUploadDuration.TotalSeconds / 1MB, 2)
             Write-Log "Part $uploadedParts uploaded in $($partUploadDuration.TotalSeconds.ToString('F2'))s (Speed: $partSpeedMBps MB/s)" -Level Success
             
-            # Verify this part
-            Write-Log "Verifying part $uploadedParts on Google Drive..." -Level Info
-            $verifyCommand = "rclone ls `"$($Config.GDriveRemote)/$partName`""
-            
-            try {
-                $verifyProcess = Start-Process -FilePath "rclone" `
-                    -ArgumentList @("ls", "`"$($Config.GDriveRemote)/$partName`"") `
-                    -Wait -NoNewWindow -PassThru `
-                    -RedirectStandardOutput "rclone_verify_stdout_$uploadedParts.tmp" `
-                    -RedirectStandardError "rclone_verify_stderr_$uploadedParts.tmp"
-                
-                $verifyExitCode = $verifyProcess.ExitCode
-                $verifyStdout = $null
-                $verifyStderr = $null
-                
-                if (Test-Path "rclone_verify_stdout_$uploadedParts.tmp") {
-                    $verifyStdout = Get-Content "rclone_verify_stdout_$uploadedParts.tmp" -Raw -ErrorAction SilentlyContinue
-                    Remove-Item "rclone_verify_stdout_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+            # Verify this part using rclone check (checksum verification)
+            if ($partChecksum) {
+                Write-Log "Verifying part $uploadedParts integrity on Google Drive using checksum..." -Level Info
+                try {
+                    $checkProcess = Start-Process -FilePath "rclone" `
+                        -ArgumentList @("check", "`"$partPath`"", "`"$($Config.GDriveRemote)/$partName`"", "--checksum", "--one-way") `
+                        -Wait -NoNewWindow -PassThru `
+                        -RedirectStandardOutput "rclone_check_stdout_$uploadedParts.tmp" `
+                        -RedirectStandardError "rclone_check_stderr_$uploadedParts.tmp"
+                    
+                    $checkExitCode = $checkProcess.ExitCode
+                    $checkStdout = $null
+                    $checkStderr = $null
+                    
+                    if (Test-Path "rclone_check_stdout_$uploadedParts.tmp") {
+                        $checkStdout = Get-Content "rclone_check_stdout_$uploadedParts.tmp" -Raw -ErrorAction SilentlyContinue
+                        Remove-Item "rclone_check_stdout_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+                    }
+                    if (Test-Path "rclone_check_stderr_$uploadedParts.tmp") {
+                        $checkStderr = Get-Content "rclone_check_stderr_$uploadedParts.tmp" -Raw -ErrorAction SilentlyContinue
+                        Remove-Item "rclone_check_stderr_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+                    }
+                    
+                    if ($checkExitCode -eq 0) {
+                        Write-Log "Part $uploadedParts checksum verification PASSED" -Level Success
+                    } else {
+                        $checkError = @()
+                        if ($checkStdout) { $checkError += "STDOUT: $($checkStdout.Trim())" }
+                        if ($checkStderr) { $checkError += "STDERR: $($checkStderr.Trim())" }
+                        $checkErrorMsg = ($checkError -join " | ") -replace '\s+', ' '
+                        Write-Log "Part $uploadedParts checksum verification FAILED!" -Level Error
+                        Write-Log "Check exit code: $checkExitCode" -Level Error
+                        Write-Log "Check output: $checkErrorMsg" -Level Error
+                        throw "Checksum verification failed for part $uploadedParts ($partName). File may be corrupted. Expected SHA256: $partChecksum"
+                    }
                 }
-                if (Test-Path "rclone_verify_stderr_$uploadedParts.tmp") {
-                    $verifyStderr = Get-Content "rclone_verify_stderr_$uploadedParts.tmp" -Raw -ErrorAction SilentlyContinue
-                    Remove-Item "rclone_verify_stderr_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+                catch {
+                    Write-Log "Exception during checksum verification: $_" -Level Error
+                    throw "Checksum verification failed for part $uploadedParts ($partName): $_"
+                }
+            } else {
+                Write-Log "WARNING: No checksum available for part $uploadedParts - skipping checksum verification" -Level Warning
+                # Fallback to size verification
+                Write-Log "Performing size verification for part $uploadedParts..." -Level Info
+                $verifyCommand = "rclone ls `"$($Config.GDriveRemote)/$partName`""
+                $verifyResult = Invoke-Expression $verifyCommand 2>&1
+                
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Log "Size verification failed for part $uploadedParts" -Level Error
+                    throw "Upload verification failed for part $uploadedParts ($partName)"
                 }
                 
-                if ($verifyExitCode -ne 0) {
-                    $verifyError = @()
-                    if ($verifyStdout) { $verifyError += "STDOUT: $($verifyStdout.Trim())" }
-                    if ($verifyStderr) { $verifyError += "STDERR: $($verifyStderr.Trim())" }
-                    $verifyErrorMsg = ($verifyError -join " | ") -replace '\s+', ' '
-                    Write-Log "Verification failed for part $uploadedParts" -Level Error
-                    Write-Log "Verification exit code: $verifyExitCode" -Level Error
-                    Write-Log "Verification error: $verifyErrorMsg" -Level Error
-                    throw "Upload verification failed for part $uploadedParts ($partName). Exit code: $verifyExitCode. Error: $verifyErrorMsg"
-                }
-                
-                $verifyResult = $verifyStdout
                 if ($verifyResult -match '(\d+)') {
                     $remoteSize = [long]$Matches[1]
                     if ($remoteSize -eq $partSizeBytes) {
@@ -2497,14 +2564,15 @@ function Publish-ToGoogleDrive {
                     } else {
                         Write-Log "WARNING: Part $uploadedParts size mismatch - local: $partSizeBytes, remote: $remoteSize" -Level Warning
                     }
-                } else {
-                    Write-Log "WARNING: Could not parse verification output for part $uploadedParts" -Level Warning
-                    Write-Log "Verification output: $verifyResult" -Level Info
                 }
             }
-            catch {
-                Write-Log "Exception during verification: $_" -Level Error
-                throw "Upload verification failed for part $uploadedParts ($partName): $_"
+            
+            # Store checksum for manifest
+            if ($partChecksum) {
+                if (-not $script:uploadChecksums) {
+                    $script:uploadChecksums = @{}
+                }
+                $script:uploadChecksums[$partName] = $partChecksum
             }
             
             $totalUploadedBytes += $partSizeBytes
@@ -2524,6 +2592,55 @@ function Publish-ToGoogleDrive {
         Write-Log "Total uploaded: $totalSizeDisplay" -Level Info
         Write-Log "Total upload time: $($overallUploadDuration.TotalSeconds.ToString('F2'))s ($([math]::Round($overallUploadDuration.TotalMinutes, 1)) minutes)" -Level Info
         Write-Log "Average upload speed: $overallSpeedMBps MB/s" -Level Info
+        
+        # Create and upload checksum manifest file
+        if ($script:uploadChecksums -and $script:uploadChecksums.Count -gt 0) {
+            Write-Log "Creating checksum manifest file..." -Level Info
+            $manifestFileName = "$BACKUP_NAME_BASE.checksums.txt"
+            $manifestPath = Join-Path $LOCAL_BACKUP_DIR $manifestFileName
+            
+            $manifestContent = @()
+            $manifestContent += "# SHA256 Checksums for backup: $BACKUP_NAME_BASE"
+            $manifestContent += "# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            $manifestContent += "# Total parts: $totalParts"
+            $manifestContent += ""
+            
+            # Sort by part number to ensure consistent order
+            $sortedParts = $script:uploadChecksums.Keys | Sort-Object
+            foreach ($partName in $sortedParts) {
+                $checksum = $script:uploadChecksums[$partName]
+                $manifestContent += "$checksum  $partName"
+            }
+            
+            $manifestContent | Out-File -FilePath $manifestPath -Encoding UTF8 -NoNewline
+            Write-Log "Checksum manifest created: $manifestPath" -Level Info
+            
+            # Upload manifest file
+            Write-Log "Uploading checksum manifest to Google Drive..." -Level Info
+            try {
+                $manifestProcess = Start-Process -FilePath "rclone" `
+                    -ArgumentList @("copy", "`"$manifestPath`"", "`"$($Config.GDriveRemote)`"", "--checksum") `
+                    -Wait -NoNewWindow -PassThru `
+                    -RedirectStandardOutput "rclone_manifest_stdout.tmp" `
+                    -RedirectStandardError "rclone_manifest_stderr.tmp"
+                
+                $manifestExitCode = $manifestProcess.ExitCode
+                
+                Remove-Item "rclone_manifest_stdout.tmp" -ErrorAction SilentlyContinue
+                Remove-Item "rclone_manifest_stderr.tmp" -ErrorAction SilentlyContinue
+                
+                if ($manifestExitCode -eq 0) {
+                    Write-Log "Checksum manifest uploaded successfully" -Level Success
+                } else {
+                    Write-Log "WARNING: Failed to upload checksum manifest (exit code: $manifestExitCode)" -Level Warning
+                }
+            }
+            catch {
+                Write-Log "WARNING: Exception uploading checksum manifest: $_" -Level Warning
+            }
+        } else {
+            Write-Log "WARNING: No checksums available to create manifest file" -Level Warning
+        }
         
         $duration = (Get-Date) - $stepStart
         Write-Log "Total upload step duration: $($duration.TotalSeconds.ToString('F2'))s ($([math]::Round($duration.TotalMinutes, 1)) minutes)" -Level Info
@@ -2872,8 +2989,9 @@ function Invoke-Backup {
         
         Write-Log "Backup created: $($localBackupPaths.Count) part(s)" -Level Info
         
-        # Upload all parts to Google Drive
-        if (-not (Publish-ToGoogleDrive -LocalPaths $localBackupPaths -Config $config)) {
+        # Upload all parts to Google Drive with checksums
+        $checksums = if ($script:backupChecksums) { $script:backupChecksums } else { $null }
+        if (-not (Publish-ToGoogleDrive -LocalPaths $localBackupPaths -Config $config -Checksums $checksums)) {
             throw "Failed to upload to Google Drive"
         }
         
@@ -3125,5 +3243,6 @@ catch {
     Read-Host "Press Enter to exit"
     exit 1
 }
+
 
 
