@@ -2344,19 +2344,111 @@ function Publish-ToGoogleDrive {
             Write-Host ""
             Write-Host "  [$uploadedParts/$totalParts] Uploading: $partName ($partSizeDisplay)" -ForegroundColor Cyan
             
-            # Upload using rclone with progress
+            # Upload using rclone with progress and retry logic
             $rcloneCommand = "rclone copy `"$partPath`" `"$($Config.GDriveRemote)`" --progress --stats 5s --verbose"
             Write-Log "Command: $rcloneCommand" -Level Info
             
-            $partUploadStart = Get-Date
-            $result = Invoke-Expression $rcloneCommand 2>&1
-            $partUploadEnd = Get-Date
-            $partUploadDuration = $partUploadEnd - $partUploadStart
+            $maxRetries = 3
+            $retryDelay = 10  # seconds
+            $uploadSuccess = $false
+            $lastError = $null
             
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log "Rclone exit code: $LASTEXITCODE" -Level Error
-                Write-Log "Rclone output: $result" -Level Error
-                throw "Failed to upload part $uploadedParts ($partName) to Google Drive. Exit code: $LASTEXITCODE"
+            for ($retryAttempt = 1; $retryAttempt -le $maxRetries; $retryAttempt++) {
+                if ($retryAttempt -gt 1) {
+                    Write-Log "Retry attempt $retryAttempt of $maxRetries for part $uploadedParts..." -Level Warning
+                    Write-Host "  Retrying upload (attempt $retryAttempt/$maxRetries)..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds $retryDelay
+                }
+                
+                $partUploadStart = Get-Date
+                try {
+                    # Capture both stdout and stderr separately for better error reporting
+                    $stdout = $null
+                    $stderr = $null
+                    
+                    $process = Start-Process -FilePath "rclone" `
+                        -ArgumentList @("copy", "`"$partPath`"", "`"$($Config.GDriveRemote)`"", "--progress", "--stats", "5s", "--verbose") `
+                        -Wait -NoNewWindow -PassThru `
+                        -RedirectStandardOutput "rclone_stdout_$uploadedParts.tmp" `
+                        -RedirectStandardError "rclone_stderr_$uploadedParts.tmp"
+                    
+                    $exitCode = $process.ExitCode
+                    
+                    # Read output files
+                    if (Test-Path "rclone_stdout_$uploadedParts.tmp") {
+                        $stdout = Get-Content "rclone_stdout_$uploadedParts.tmp" -Raw -ErrorAction SilentlyContinue
+                        Remove-Item "rclone_stdout_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+                    }
+                    if (Test-Path "rclone_stderr_$uploadedParts.tmp") {
+                        $stderr = Get-Content "rclone_stderr_$uploadedParts.tmp" -Raw -ErrorAction SilentlyContinue
+                        Remove-Item "rclone_stderr_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+                    }
+                    
+                    $partUploadEnd = Get-Date
+                    $partUploadDuration = $partUploadEnd - $partUploadStart
+                    
+                    if ($exitCode -eq 0) {
+                        $uploadSuccess = $true
+                        # Log successful output (last few lines for progress info)
+                        if ($stdout) {
+                            $stdoutLines = $stdout -split "`n" | Where-Object { $_.Trim() -ne "" }
+                            $lastLines = $stdoutLines[-5..-1] | Where-Object { $_ -ne $null }
+                            if ($lastLines) {
+                                Write-Log "Rclone output (last 5 lines): $($lastLines -join ' | ')" -Level Info
+                            }
+                        }
+                        break
+                    }
+                    else {
+                        # Format error output for logging
+                        $errorDetails = @()
+                        if ($stdout) {
+                            $errorDetails += "STDOUT: $($stdout.Trim())"
+                        }
+                        if ($stderr) {
+                            $errorDetails += "STDERR: $($stderr.Trim())"
+                        }
+                        $errorMessage = $errorDetails -join " | "
+                        
+                        Write-Log "Rclone upload failed (attempt $retryAttempt/$maxRetries)" -Level Warning
+                        Write-Log "Exit code: $exitCode" -Level Warning
+                        Write-Log "Error details: $errorMessage" -Level Warning
+                        
+                        $lastError = "Exit code: $exitCode. $errorMessage"
+                        
+                        # Don't retry on certain errors (authentication, file not found, etc.)
+                        $nonRetryableErrors = @("authentication", "unauthorized", "not found", "no such file", "permission denied")
+                        $shouldRetry = $true
+                        foreach ($nonRetryable in $nonRetryableErrors) {
+                            if ($errorMessage -match $nonRetryable) {
+                                Write-Log "Non-retryable error detected: $nonRetryable" -Level Error
+                                $shouldRetry = $false
+                                break
+                            }
+                        }
+                        
+                        if (-not $shouldRetry) {
+                            break
+                        }
+                    }
+                }
+                catch {
+                    $partUploadEnd = Get-Date
+                    $partUploadDuration = $partUploadEnd - $partUploadStart
+                    $lastError = "Exception during upload: $_"
+                    Write-Log "Exception during rclone upload (attempt $retryAttempt/$maxRetries): $_" -Level Warning
+                    
+                    # Clean up temp files if they exist
+                    Remove-Item "rclone_stdout_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+                    Remove-Item "rclone_stderr_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+                }
+            }
+            
+            if (-not $uploadSuccess) {
+                $errorMsg = "Failed to upload part $uploadedParts ($partName) to Google Drive after $maxRetries attempt(s). $lastError"
+                Write-Log $errorMsg -Level Error
+                Write-Host "  ERROR: Upload failed for part $uploadedParts" -ForegroundColor Red
+                throw $errorMsg
             }
             
             $partSpeedMBps = [math]::Round($partSizeBytes / $partUploadDuration.TotalSeconds / 1MB, 2)
@@ -2365,20 +2457,54 @@ function Publish-ToGoogleDrive {
             # Verify this part
             Write-Log "Verifying part $uploadedParts on Google Drive..." -Level Info
             $verifyCommand = "rclone ls `"$($Config.GDriveRemote)/$partName`""
-            $verifyResult = Invoke-Expression $verifyCommand 2>&1
             
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log "Verification failed for part $uploadedParts" -Level Error
-                throw "Upload verification failed for part $uploadedParts ($partName)"
-            }
-            
-            if ($verifyResult -match '(\d+)') {
-                $remoteSize = [long]$Matches[1]
-                if ($remoteSize -eq $partSizeBytes) {
-                    Write-Log "Part $uploadedParts verified: size matches ($remoteSize bytes)" -Level Success
-                } else {
-                    Write-Log "WARNING: Part $uploadedParts size mismatch - local: $partSizeBytes, remote: $remoteSize" -Level Warning
+            try {
+                $verifyProcess = Start-Process -FilePath "rclone" `
+                    -ArgumentList @("ls", "`"$($Config.GDriveRemote)/$partName`"") `
+                    -Wait -NoNewWindow -PassThru `
+                    -RedirectStandardOutput "rclone_verify_stdout_$uploadedParts.tmp" `
+                    -RedirectStandardError "rclone_verify_stderr_$uploadedParts.tmp"
+                
+                $verifyExitCode = $verifyProcess.ExitCode
+                $verifyStdout = $null
+                $verifyStderr = $null
+                
+                if (Test-Path "rclone_verify_stdout_$uploadedParts.tmp") {
+                    $verifyStdout = Get-Content "rclone_verify_stdout_$uploadedParts.tmp" -Raw -ErrorAction SilentlyContinue
+                    Remove-Item "rclone_verify_stdout_$uploadedParts.tmp" -ErrorAction SilentlyContinue
                 }
+                if (Test-Path "rclone_verify_stderr_$uploadedParts.tmp") {
+                    $verifyStderr = Get-Content "rclone_verify_stderr_$uploadedParts.tmp" -Raw -ErrorAction SilentlyContinue
+                    Remove-Item "rclone_verify_stderr_$uploadedParts.tmp" -ErrorAction SilentlyContinue
+                }
+                
+                if ($verifyExitCode -ne 0) {
+                    $verifyError = @()
+                    if ($verifyStdout) { $verifyError += "STDOUT: $($verifyStdout.Trim())" }
+                    if ($verifyStderr) { $verifyError += "STDERR: $($verifyStderr.Trim())" }
+                    $verifyErrorMsg = ($verifyError -join " | ") -replace '\s+', ' '
+                    Write-Log "Verification failed for part $uploadedParts" -Level Error
+                    Write-Log "Verification exit code: $verifyExitCode" -Level Error
+                    Write-Log "Verification error: $verifyErrorMsg" -Level Error
+                    throw "Upload verification failed for part $uploadedParts ($partName). Exit code: $verifyExitCode. Error: $verifyErrorMsg"
+                }
+                
+                $verifyResult = $verifyStdout
+                if ($verifyResult -match '(\d+)') {
+                    $remoteSize = [long]$Matches[1]
+                    if ($remoteSize -eq $partSizeBytes) {
+                        Write-Log "Part $uploadedParts verified: size matches ($remoteSize bytes)" -Level Success
+                    } else {
+                        Write-Log "WARNING: Part $uploadedParts size mismatch - local: $partSizeBytes, remote: $remoteSize" -Level Warning
+                    }
+                } else {
+                    Write-Log "WARNING: Could not parse verification output for part $uploadedParts" -Level Warning
+                    Write-Log "Verification output: $verifyResult" -Level Info
+                }
+            }
+            catch {
+                Write-Log "Exception during verification: $_" -Level Error
+                throw "Upload verification failed for part $uploadedParts ($partName): $_"
             }
             
             $totalUploadedBytes += $partSizeBytes
@@ -2406,7 +2532,16 @@ function Publish-ToGoogleDrive {
     }
     catch {
         $duration = (Get-Date) - $stepStart
-        Write-Log "Failed to upload to Google Drive after $($duration.TotalSeconds.ToString('F2'))s: $_" -Level Error
+        $errorDetails = $_.Exception.Message
+        if ($_.Exception.InnerException) {
+            $errorDetails += " | Inner: $($_.Exception.InnerException.Message)"
+        }
+        Write-Log "Failed to upload to Google Drive after $($duration.TotalSeconds.ToString('F2'))s" -Level Error
+        Write-Log "Error details: $errorDetails" -Level Error
+        Write-Log "Error at: $($_.InvocationInfo.ScriptLineNumber):$($_.InvocationInfo.PositionMessage)" -Level Error
+        if ($_.ScriptStackTrace) {
+            Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level Error
+        }
         return $false
     }
 }
