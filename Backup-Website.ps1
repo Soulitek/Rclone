@@ -2001,6 +2001,7 @@ function Get-BackupArchive {
         Write-Log "Remote command: $tarCommand" -Level Info
         
         Write-Log "Starting backup stream with verbose output..." -Level Info
+        Write-Log "SSH target: $($Config.SSHUser)@$($Config.SSHHost):$($Config.SSHPort)" -Level Info
         Write-Host ""
         
         # Use .NET Process class for real-time stderr output while capturing stdout to file
@@ -2012,13 +2013,21 @@ function Get-BackupArchive {
         $processInfo.RedirectStandardError = $true
         $processInfo.CreateNoWindow = $true
         
+        Write-Log "SSH Process Arguments: $($processInfo.Arguments)" -Level Info
+        
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         
-        # Track progress
-        $fileCount = 0
+        # Track progress using script-scoped variables for event handler access
+        $script:streamFileCount = 0
+        $script:streamStartTime = Get-Date
+        $script:streamLastReportTime = Get-Date
+        $script:streamBytesWritten = 0
+        $script:streamLastFile = ""
         $lastReportTime = Get-Date
         $startTime = Get-Date
+        
+        Write-Log "Initializing SSH connection and tar stream..." -Level Info
         
         # Event handler for stderr (verbose output showing files)
         $stderrHandler = {
@@ -2026,19 +2035,20 @@ function Get-BackupArchive {
                 $line = $EventArgs.Data
                 # Skip tar info messages, show actual file paths
                 if ($line -notmatch "^tar:" -and $line.Trim() -ne "") {
-                    $script:fileCount++
+                    $script:streamFileCount++
+                    $script:streamLastFile = $line
                     # Show every file or periodically show progress
-                    $elapsed = (Get-Date) - $script:startTime
+                    $elapsed = (Get-Date) - $script:streamStartTime
                     $elapsedStr = "{0:mm\:ss}" -f $elapsed
                     
                     # Truncate long paths for display
                     $displayPath = if ($line.Length -gt 80) { "..." + $line.Substring($line.Length - 77) } else { $line }
-                    Write-Host "`r  [$elapsedStr] Files: $($script:fileCount) | $displayPath".PadRight(120) -NoNewline -ForegroundColor Cyan
+                    Write-Host "`r  [$elapsedStr] Files: $($script:streamFileCount) | $displayPath".PadRight(120) -NoNewline -ForegroundColor Cyan
                 }
                 elseif ($line -match "^tar:") {
                     # Show tar warnings/info
                     Write-Host ""
-                    Write-Host "  $line" -ForegroundColor Yellow
+                    Write-Host "  [TAR] $line" -ForegroundColor Yellow
                 }
             }
         }
@@ -2048,42 +2058,71 @@ function Get-BackupArchive {
         
         try {
             # Start the process
+            Write-Log "Starting SSH process..." -Level Info
             $process.Start() | Out-Null
             $process.BeginErrorReadLine()
+            Write-Log "SSH process started (PID: $($process.Id))" -Level Info
+            Write-Log "Streaming tar data to local file..." -Level Info
             
             # Read stdout (tar data) and write to file
             $outputStream = [System.IO.File]::Create($localPath)
+            $totalBytesWritten = 0
+            $lastProgressBytes = 0
+            
             try {
                 $buffer = New-Object byte[] 65536
                 $stdoutStream = $process.StandardOutput.BaseStream
+                
+                Write-Log "Reading data stream (buffer size: 64KB)..." -Level Info
                 
                 while ($true) {
                     $bytesRead = $stdoutStream.Read($buffer, 0, $buffer.Length)
                     if ($bytesRead -eq 0) { break }
                     $outputStream.Write($buffer, 0, $bytesRead)
+                    $totalBytesWritten += $bytesRead
+                    $script:streamBytesWritten = $totalBytesWritten
                     
                     # Periodically show file size progress
                     $now = Get-Date
                     if (($now - $lastReportTime).TotalSeconds -ge 5) {
                         $currentSize = $outputStream.Length
                         $sizeMB = [math]::Round($currentSize / 1MB, 1)
+                        $sizeGB = [math]::Round($currentSize / 1GB, 2)
                         $elapsed = $now - $startTime
-                        $elapsedStr = "{0:mm\:ss}" -f $elapsed
+                        $elapsedStr = "{0:hh\:mm\:ss}" -f $elapsed
+                        
+                        # Calculate transfer speed
+                        $bytesInInterval = $currentSize - $lastProgressBytes
+                        $speedMBps = [math]::Round($bytesInInterval / 5 / 1MB, 2)
+                        $lastProgressBytes = $currentSize
+                        
+                        $sizeDisplay = if ($sizeGB -ge 1) { "${sizeGB} GB" } else { "${sizeMB} MB" }
+                        
                         Write-Host ""
-                        Write-Host "  [$elapsedStr] Archive size: ${sizeMB} MB | Files processed: $fileCount" -ForegroundColor Green
+                        Write-Host "  [$elapsedStr] Archive: $sizeDisplay | Speed: ${speedMBps} MB/s | Files: $($script:streamFileCount)" -ForegroundColor Green
+                        
+                        # Also log to file periodically
+                        if (($now - $lastReportTime).TotalSeconds -ge 30) {
+                            Write-Log "Progress: $sizeDisplay transferred, $($script:streamFileCount) files, Speed: ${speedMBps} MB/s" -Level Info
+                        }
+                        
                         $lastReportTime = $now
                     }
                 }
             }
             finally {
                 $outputStream.Close()
+                Write-Log "Output stream closed. Total bytes written: $totalBytesWritten" -Level Info
             }
             
+            Write-Log "Waiting for SSH process to complete..." -Level Info
             $process.WaitForExit()
             $exitCode = $process.ExitCode
             
             Write-Host ""
             Write-Host ""
+            
+            Write-Log "SSH process completed with exit code: $exitCode" -Level Info
             
             if ($exitCode -ne 0) {
                 # tar with --ignore-failed-read may return exit code 1 for minor issues
@@ -2095,7 +2134,10 @@ function Get-BackupArchive {
                 }
             }
             
-            Write-Log "Processed $fileCount files/directories" -Level Info
+            Write-Log "Processed $($script:streamFileCount) files/directories" -Level Info
+            if ($script:streamLastFile -ne "") {
+                Write-Log "Last file processed: $($script:streamLastFile)" -Level Info
+            }
         }
         finally {
             Unregister-Event -SourceIdentifier $stdErrEvent.Name -ErrorAction SilentlyContinue
@@ -2107,6 +2149,7 @@ function Get-BackupArchive {
         }
         
         # Verify the backup was created
+        Write-Log "Verifying local backup file..." -Level Info
         if (-not (Test-Path $localPath)) {
             throw "Backup file not found after streaming: $localPath"
         }
@@ -2116,18 +2159,34 @@ function Get-BackupArchive {
         $fileSizeMB = [math]::Round($fileSizeBytes / 1MB, 2)
         $fileSizeGB = [math]::Round($fileSizeBytes / 1GB, 2)
         
+        Write-Log "Local backup file verified: $localPath" -Level Info
+        Write-Log "File exists: Yes" -Level Info
+        Write-Log "File size (bytes): $fileSizeBytes" -Level Info
+        Write-Log "File size (MB): $fileSizeMB" -Level Info
+        Write-Log "File size (GB): $fileSizeGB" -Level Info
+        Write-Log "File created: $($fileInfo.CreationTime)" -Level Info
+        Write-Log "File last modified: $($fileInfo.LastWriteTime)" -Level Info
+        
         # Warn if suspiciously small
         if ($fileSizeBytes -lt 1048576) {  # Less than 1MB
-            Write-Log "Warning: Backup size is very small ($fileSizeMB MB). Backup may be empty or incomplete." -Level Warning
+            Write-Log "WARNING: Backup size is very small ($fileSizeMB MB). Backup may be empty or incomplete." -Level Warning
+            Write-Log "Expected to process files but backup is under 1MB - please verify source path." -Level Warning
         }
         
         $duration = (Get-Date) - $stepStart
         $sizeDisplay = if ($fileSizeGB -ge 1) { "$fileSizeGB GB" } else { "$fileSizeMB MB" }
         
-        Write-Log "Backup stream completed successfully" -Level Success
+        # Calculate transfer rate
+        $transferRateMBps = [math]::Round($fileSizeMB / $duration.TotalSeconds, 2)
+        
+        Write-Log "========================================" -Level Success
+        Write-Log "Backup stream completed successfully!" -Level Success
+        Write-Log "========================================" -Level Success
         Write-Log "Local file: $localPath" -Level Info
         Write-Log "File size: $sizeDisplay" -Level Info
+        Write-Log "Files/directories processed: $($script:streamFileCount)" -Level Info
         Write-Log "Duration: $($duration.TotalSeconds.ToString('F2'))s ($([math]::Round($duration.TotalMinutes, 1)) minutes)" -Level Info
+        Write-Log "Average transfer rate: $transferRateMBps MB/s" -Level Info
         
         return $localPath
     }
@@ -2157,35 +2216,86 @@ function Publish-ToGoogleDrive {
     $stepStart = Get-Date
     
     try {
-        Write-Log "Uploading: $LocalPath" -Level Info
-        Write-Log "Destination: $($Config.GDriveRemote)/$BACKUP_NAME" -Level Info
+        # Get file info for verbose logging
+        $fileInfo = Get-Item $LocalPath
+        $fileSizeBytes = $fileInfo.Length
+        $fileSizeMB = [math]::Round($fileSizeBytes / 1MB, 2)
+        $fileSizeGB = [math]::Round($fileSizeBytes / 1GB, 2)
+        $sizeDisplay = if ($fileSizeGB -ge 1) { "$fileSizeGB GB" } else { "$fileSizeMB MB" }
+        
+        Write-Log "Source file: $LocalPath" -Level Info
+        Write-Log "Source file size: $sizeDisplay ($fileSizeBytes bytes)" -Level Info
+        Write-Log "Destination remote: $($Config.GDriveRemote)" -Level Info
+        Write-Log "Destination path: $($Config.GDriveRemote)/$BACKUP_NAME" -Level Info
         
         if ($DryRun) {
             Write-Log "[DRY RUN] Would upload to Google Drive" -Level Warning
             return $true
         }
         
-        # Upload using rclone with progress
-        $rcloneCommand = "rclone copy `"$LocalPath`" `"$($Config.GDriveRemote)`" --progress --stats 5s"
-        Write-Log "Executing: $rcloneCommand" -Level Info
+        # Estimate upload time based on typical speeds
+        $estimatedMinutes = [math]::Round($fileSizeBytes / (10 * 1MB) / 60, 1)  # Assuming ~10 MB/s
+        Write-Log "Estimated upload time: ~$estimatedMinutes minutes (depends on connection speed)" -Level Info
         
+        # Upload using rclone with progress and verbose output
+        $rcloneCommand = "rclone copy `"$LocalPath`" `"$($Config.GDriveRemote)`" --progress --stats 5s --verbose"
+        Write-Log "Executing rclone upload command..." -Level Info
+        Write-Log "Command: $rcloneCommand" -Level Info
+        Write-Host ""
+        Write-Host "  Starting Google Drive upload..." -ForegroundColor Cyan
+        Write-Host "  File: $BACKUP_NAME" -ForegroundColor Cyan
+        Write-Host "  Size: $sizeDisplay" -ForegroundColor Cyan
+        Write-Host ""
+        
+        $uploadStartTime = Get-Date
         $result = Invoke-Expression $rcloneCommand 2>&1
+        $uploadEndTime = Get-Date
+        $uploadDuration = $uploadEndTime - $uploadStartTime
+        
+        Write-Host ""
         
         if ($LASTEXITCODE -ne 0) {
+            Write-Log "Rclone exit code: $LASTEXITCODE" -Level Error
+            Write-Log "Rclone output: $result" -Level Error
             throw "Failed to upload to Google Drive. Exit code: $LASTEXITCODE, Output: $result"
         }
         
+        Write-Log "Rclone upload process completed (exit code: $LASTEXITCODE)" -Level Info
+        Write-Log "Upload duration: $($uploadDuration.TotalSeconds.ToString('F2'))s ($([math]::Round($uploadDuration.TotalMinutes, 1)) minutes)" -Level Info
+        
+        # Calculate actual upload speed
+        $actualSpeedMBps = [math]::Round($fileSizeBytes / $uploadDuration.TotalSeconds / 1MB, 2)
+        Write-Log "Average upload speed: $actualSpeedMBps MB/s" -Level Info
+        
         # Verify upload
+        Write-Log "Verifying upload on Google Drive..." -Level Info
         $verifyCommand = "rclone ls `"$($Config.GDriveRemote)/$BACKUP_NAME`""
+        Write-Log "Verification command: $verifyCommand" -Level Info
         $verifyResult = Invoke-Expression $verifyCommand 2>&1
         
         if ($LASTEXITCODE -ne 0) {
+            Write-Log "Verification failed - file not found on Google Drive" -Level Error
+            Write-Log "Verification output: $verifyResult" -Level Error
             throw "Upload verification failed. File not found on Google Drive."
         }
         
+        # Parse verification result to confirm file size
+        Write-Log "Verification result: $verifyResult" -Level Info
+        if ($verifyResult -match '(\d+)') {
+            $remoteSize = [long]$Matches[1]
+            $remoteSizeGB = [math]::Round($remoteSize / 1GB, 2)
+            Write-Log "Remote file size verified: $remoteSizeGB GB ($remoteSize bytes)" -Level Info
+            
+            if ($remoteSize -ne $fileSizeBytes) {
+                Write-Log "WARNING: Remote file size ($remoteSize) differs from local file size ($fileSizeBytes)" -Level Warning
+            } else {
+                Write-Log "File size verification passed - local and remote sizes match" -Level Success
+            }
+        }
+        
         $duration = (Get-Date) - $stepStart
-        Write-Log "Upload completed successfully" -Level Success
-        Write-Log "Duration: $($duration.TotalSeconds.ToString('F2'))s" -Level Info
+        Write-Log "Upload completed successfully!" -Level Success
+        Write-Log "Total upload step duration: $($duration.TotalSeconds.ToString('F2'))s ($([math]::Round($duration.TotalMinutes, 1)) minutes)" -Level Info
         
         return $true
     }
