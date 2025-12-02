@@ -7,9 +7,9 @@
     1. Connecting to remote server via SSH (key authentication)
     2. Creating compressed tar.gz archive on remote server
     3. Downloading archive to local machine
-    4. Uploading to Google Drive via rclone
+    4. Uploading to Google Drive via rclone (unless -LocalOnly is specified)
     5. Rotating backups (keeping last 7)
-    6. Cleaning up temporary files
+    6. Cleaning up temporary files (unless -LocalOnly is specified)
 
 .PARAMETER SSHUser
     Remote server username. If not provided, retrieves from Windows Credential Manager.
@@ -32,6 +32,10 @@
 .PARAMETER SkipRotation
     If specified, skips the backup rotation (keeps all backups).
 
+.PARAMETER LocalOnly
+    If specified, downloads backup files locally without uploading to Google Drive.
+    Files will be preserved in the local backup directory for manual access.
+
 .EXAMPLE
     .\Backup-Website.ps1
     Runs backup with configuration from Windows Credential Manager.
@@ -43,6 +47,10 @@
 .EXAMPLE
     .\Backup-Website.ps1 -SSHUser admin -SSHHost example.com -RemotePath /var/www/html -GDriveRemote "gdrive:backups/website"
     Runs backup with specified parameters.
+
+.EXAMPLE
+    .\Backup-Website.ps1 -LocalOnly
+    Downloads backup files locally without uploading to Google Drive.
 
 .NOTES
     Requirements:
@@ -90,7 +98,10 @@ param(
     [switch]$ForceSetup,
     
     [Parameter(Mandatory=$false)]
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$LocalOnly
 )
 
 # =============================================================================
@@ -301,6 +312,86 @@ function Read-UserInput {
         }
         
         Write-ColorMessage "This field is required. Please enter a value." -Type Warning
+    } while ($true)
+}
+
+function Read-BackupDirectory {
+    <#
+    .SYNOPSIS
+        Prompts user for a backup directory path with validation.
+    #>
+    [CmdletBinding()]
+    param()
+    
+    $defaultPath = Join-Path $env:TEMP "website-backups"
+    
+    Write-Host ""
+    Write-ColorMessage "Enter the directory path where backup files should be saved." -Type Info
+    Write-ColorMessage "The directory will be created if it doesn't exist." -Type Info
+    Write-Host ""
+    
+    do {
+        $path = Read-UserInput -Prompt "Backup directory path" -DefaultValue $defaultPath
+        
+        if ([string]::IsNullOrEmpty($path)) {
+            Write-ColorMessage "Path cannot be empty. Please enter a valid directory path." -Type Warning
+            continue
+        }
+        
+        # Expand environment variables and user paths
+        try {
+            $expandedPath = [System.Environment]::ExpandEnvironmentVariables($path)
+            if ($expandedPath.StartsWith("~")) {
+                $expandedPath = $expandedPath -replace "^~", $env:USERPROFILE
+            }
+            
+            # Validate path format
+            if (-not ([System.IO.Path]::IsPathRooted($expandedPath))) {
+                Write-ColorMessage "Please enter an absolute path (e.g., C:\Backups or D:\MyBackups)." -Type Warning
+                continue
+            }
+            
+            # Try to create directory if it doesn't exist
+            try {
+                if (-not (Test-Path $expandedPath)) {
+                    Write-ColorMessage "Directory does not exist. Creating: $expandedPath" -Type Info
+                    New-Item -Path $expandedPath -ItemType Directory -Force | Out-Null
+                    Write-ColorMessage "Directory created successfully." -Type Success
+                }
+                else {
+                    # Verify it's a directory, not a file
+                    $item = Get-Item $expandedPath -ErrorAction Stop
+                    if (-not $item.PSIsContainer) {
+                        Write-ColorMessage "The specified path exists but is a file, not a directory. Please enter a directory path." -Type Error
+                        continue
+                    }
+                    Write-ColorMessage "Directory exists: $expandedPath" -Type Success
+                }
+                
+                # Test write permissions
+                $testFile = Join-Path $expandedPath "test_write_permissions.tmp"
+                try {
+                    "test" | Out-File -FilePath $testFile -ErrorAction Stop
+                    Remove-Item -Path $testFile -ErrorAction Stop
+                    Write-ColorMessage "Write permissions verified." -Type Success
+                }
+                catch {
+                    Write-ColorMessage "Cannot write to this directory. Please check permissions or choose a different path." -Type Error
+                    continue
+                }
+                
+                return $expandedPath
+            }
+            catch {
+                Write-ColorMessage "Failed to create or access directory: $_" -Type Error
+                Write-ColorMessage "Please check the path and try again." -Type Warning
+                continue
+            }
+        }
+        catch {
+            Write-ColorMessage "Invalid path format: $_" -Type Error
+            continue
+        }
     } while ($true)
 }
 
@@ -1925,24 +2016,29 @@ function Test-Prerequisites {
         $allPrereqsMet = $false
     }
     
-    # Check rclone (with timeout to prevent hanging)
-    try {
-        $rcloneJob = Start-Job -ScriptBlock { rclone version 2>&1 | Select-Object -First 1 }
-        $jobResult = Wait-Job -Job $rcloneJob -Timeout 10
-        if ($jobResult) {
-            $rcloneVersion = Receive-Job -Job $rcloneJob
-            Remove-Job -Job $rcloneJob -Force
-            Write-Log "Rclone found: $rcloneVersion" -Level Success
+    # Check rclone (only if not in local-only mode)
+    if (-not $LocalOnly) {
+        try {
+            $rcloneJob = Start-Job -ScriptBlock { rclone version 2>&1 | Select-Object -First 1 }
+            $jobResult = Wait-Job -Job $rcloneJob -Timeout 10
+            if ($jobResult) {
+                $rcloneVersion = Receive-Job -Job $rcloneJob
+                Remove-Job -Job $rcloneJob -Force
+                Write-Log "Rclone found: $rcloneVersion" -Level Success
+            }
+            else {
+                Stop-Job -Job $rcloneJob -ErrorAction SilentlyContinue
+                Remove-Job -Job $rcloneJob -Force -ErrorAction SilentlyContinue
+                throw "Rclone check timed out"
+            }
         }
-        else {
-            Stop-Job -Job $rcloneJob -ErrorAction SilentlyContinue
-            Remove-Job -Job $rcloneJob -Force -ErrorAction SilentlyContinue
-            throw "Rclone check timed out"
+        catch {
+            Write-Log "Rclone not found or not responding. Please install rclone and configure Google Drive remote." -Level Error
+            $allPrereqsMet = $false
         }
     }
-    catch {
-        Write-Log "Rclone not found or not responding. Please install rclone and configure Google Drive remote." -Level Error
-        $allPrereqsMet = $false
+    else {
+        Write-Log "Skipping rclone check (LocalOnly mode - cloud upload not required)" -Level Info
     }
     
     return $allPrereqsMet
@@ -2649,17 +2745,58 @@ function Publish-ToGoogleDrive {
     }
     catch {
         $duration = (Get-Date) - $stepStart
-        $errorDetails = $_.Exception.Message
-        if ($_.Exception.InnerException) {
-            $errorDetails += " | Inner: $($_.Exception.InnerException.Message)"
-        }
-        Write-Log "Failed to upload to Google Drive after $($duration.TotalSeconds.ToString('F2'))s" -Level Error
-        Write-Log "Error details: $errorDetails" -Level Error
-        Write-Log "Error at: $($_.InvocationInfo.ScriptLineNumber):$($_.InvocationInfo.PositionMessage)" -Level Error
-        if ($_.ScriptStackTrace) {
-            Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level Error
-        }
+        Write-Log "Failed to upload to Google Drive after $($duration.TotalSeconds.ToString('F2'))s: $_" -Level Error
+        Write-Log $_.ScriptStackTrace -Level Error
         return $false
+    }
+}
+
+function New-LocalChecksumManifest {
+    <#
+    .SYNOPSIS
+        Creates a checksum manifest file locally (without uploading) for local-only backups.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Checksums,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$BackupNameBase
+    )
+    
+    try {
+        if (-not $Checksums -or $Checksums.Count -eq 0) {
+            Write-Log "WARNING: No checksums available to create manifest file" -Level Warning
+            return $null
+        }
+        
+        Write-Log "Creating local checksum manifest file..." -Level Info
+        $manifestFileName = "$BackupNameBase.checksums.txt"
+        $manifestPath = Join-Path $LOCAL_BACKUP_DIR $manifestFileName
+        
+        $manifestContent = @()
+        $manifestContent += "# SHA256 Checksums for backup: $BackupNameBase"
+        $manifestContent += "# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $manifestContent += "# Total parts: $($Checksums.Count)"
+        $manifestContent += "# Local-only backup - manifest saved locally"
+        $manifestContent += ""
+        
+        # Sort by part number to ensure consistent order
+        $sortedParts = $Checksums.Keys | Sort-Object
+        foreach ($partName in $sortedParts) {
+            $checksum = $Checksums[$partName]
+            $manifestContent += "$checksum  $partName"
+        }
+        
+        $manifestContent | Out-File -FilePath $manifestPath -Encoding UTF8 -NoNewline
+        Write-Log "Checksum manifest created locally: $manifestPath" -Level Success
+        
+        return $manifestPath
+    }
+    catch {
+        Write-Log "Failed to create checksum manifest: $_" -Level Error
+        return $null
     }
 }
 
@@ -2773,6 +2910,7 @@ function Remove-TempFiles {
     .SYNOPSIS
         Cleans up temporary local backup files after upload to Google Drive.
         Note: No remote cleanup needed since backup streams directly without creating server-side files.
+        When -LocalOnly is specified, files are preserved instead of deleted.
     #>
     [CmdletBinding()]
     param(
@@ -2790,6 +2928,23 @@ function Remove-TempFiles {
     try {
         if ($null -eq $LocalPaths -or $LocalPaths.Count -eq 0) {
             Write-Log "No local temp files to clean up" -Level Info
+            return $true
+        }
+        
+        # If LocalOnly mode, preserve files instead of deleting
+        if ($LocalOnly) {
+            Write-Log "Local-only mode: Preserving backup files in $LOCAL_BACKUP_DIR" -Level Info
+            Write-Log "Files will remain available for manual access" -Level Info
+            
+            foreach ($localPath in $LocalPaths) {
+                if (-not [string]::IsNullOrEmpty($localPath) -and (Test-Path $localPath)) {
+                    $fileName = Split-Path -Leaf $localPath
+                    Write-Log "Preserved: $fileName" -Level Info
+                }
+            }
+            
+            $duration = (Get-Date) - $stepStart
+            Write-Log "Files preserved (Duration: $($duration.TotalSeconds.ToString('F2'))s)" -Level Success
             return $true
         }
         
@@ -2887,14 +3042,35 @@ function Show-BackupCompleteNotification {
         [string]$TotalSize,
         
         [Parameter(Mandatory=$true)]
-        [string]$Duration
+        [string]$Duration,
+        
+        [Parameter(Mandatory=$false)]
+        [switch]$LocalOnly,
+        
+        [Parameter(Mandatory=$false)]
+        [string]$BackupDirectory
     )
     
     try {
         # Load Windows Forms assembly for MessageBox
         Add-Type -AssemblyName System.Windows.Forms
         
-        $message = @"
+        if ($LocalOnly) {
+            $message = @"
+Backup completed successfully!
+
+Backup Name: $BackupName
+Parts: $PartCount
+Total Size: $TotalSize
+Duration: $Duration
+
+Files saved locally to:
+$BackupDirectory
+"@
+            $title = "Website Backup - Complete (Local Only)"
+        }
+        else {
+            $message = @"
 Backup completed successfully!
 
 Backup Name: $BackupName
@@ -2904,8 +3080,8 @@ Duration: $Duration
 
 All files have been uploaded to Google Drive.
 "@
-        
-        $title = "Website Backup - Complete"
+            $title = "Website Backup - Complete"
+        }
         
         [System.Windows.Forms.MessageBox]::Show(
             $message,
@@ -2949,6 +3125,9 @@ function Invoke-Backup {
         Write-Log "  WEBSITE BACKUP SCRIPT" -Level Info
         Write-Log "  Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level Info
         Write-Log "  Split size: $SPLIT_SIZE_DISPLAY per part" -Level Info
+        if ($LocalOnly) {
+            Write-Log "  Mode: LOCAL-ONLY (no cloud upload)" -Level Info
+        }
         Write-Log "========================================" -Level Info
         
         # Initialize environment
@@ -2989,13 +3168,7 @@ function Invoke-Backup {
         
         Write-Log "Backup created: $($localBackupPaths.Count) part(s)" -Level Info
         
-        # Upload all parts to Google Drive with checksums
-        $checksums = if ($script:backupChecksums) { $script:backupChecksums } else { $null }
-        if (-not (Publish-ToGoogleDrive -LocalPaths $localBackupPaths -Config $config -Checksums $checksums)) {
-            throw "Failed to upload to Google Drive"
-        }
-        
-        # Calculate total size for notification
+        # Calculate total size for notification and logging
         $totalSizeBytes = 0
         foreach ($partPath in $localBackupPaths) {
             if (Test-Path $partPath) {
@@ -3006,12 +3179,52 @@ function Invoke-Backup {
         $totalSizeMB = [math]::Round($totalSizeBytes / 1MB, 2)
         $totalSizeDisplay = if ($totalSizeGB -ge 1) { "$totalSizeGB GB" } else { "$totalSizeMB MB" }
         
-        # Rotate old backups
-        if (-not $SkipRotation) {
-            Remove-OldBackups -Config $config
+        # Upload to Google Drive or create local checksum manifest
+        $checksums = if ($script:backupChecksums) { $script:backupChecksums } else { $null }
+        
+        if ($LocalOnly) {
+            Write-Log "Local-only mode: Skipping cloud upload" -Level Info
+            Write-Log "Backup files saved to: $LOCAL_BACKUP_DIR" -Level Info
+            
+            # Create checksum manifest locally for verification
+            if ($checksums -and $checksums.Count -gt 0) {
+                $manifestPath = New-LocalChecksumManifest -Checksums $checksums -BackupNameBase $BACKUP_NAME_BASE
+                if ($manifestPath) {
+                    Write-Log "Checksum manifest saved locally: $manifestPath" -Level Success
+                }
+            }
+            
+            # List all backup files for user reference
+            Write-Log "Local backup files:" -Level Info
+            foreach ($partPath in $localBackupPaths) {
+                if (Test-Path $partPath) {
+                    $partName = Split-Path -Leaf $partPath
+                    $partSize = (Get-Item $partPath).Length
+                    $partSizeMB = [math]::Round($partSize / 1MB, 2)
+                    $partSizeGB = [math]::Round($partSize / 1GB, 2)
+                    $partSizeDisplay = if ($partSizeGB -ge 1) { "$partSizeGB GB" } else { "$partSizeMB MB" }
+                    Write-Log "  - $partName ($partSizeDisplay)" -Level Info
+                }
+            }
         }
         else {
-            Write-Log "Skipping backup rotation (SkipRotation flag set)" -Level Warning
+            # Upload all parts to Google Drive with checksums
+            if (-not (Publish-ToGoogleDrive -LocalPaths $localBackupPaths -Config $config -Checksums $checksums)) {
+                throw "Failed to upload to Google Drive"
+            }
+        }
+        
+        # Rotate old backups (only if not in local-only mode, as rotation is for cloud backups)
+        if (-not $LocalOnly) {
+            if (-not $SkipRotation) {
+                Remove-OldBackups -Config $config
+            }
+            else {
+                Write-Log "Skipping backup rotation (SkipRotation flag set)" -Level Warning
+            }
+        }
+        else {
+            Write-Log "Skipping backup rotation (LocalOnly mode - no cloud backups to rotate)" -Level Info
         }
         
         $backupSuccess = $true
@@ -3020,7 +3233,12 @@ function Invoke-Backup {
         if (-not $NonInteractive) {
             $uploadDuration = (Get-Date) - $SCRIPT_START_TIME
             $durationDisplay = $uploadDuration.ToString('hh\:mm\:ss')
-            Show-BackupCompleteNotification -BackupName $BACKUP_NAME_BASE -PartCount $localBackupPaths.Count -TotalSize $totalSizeDisplay -Duration $durationDisplay
+            if ($LocalOnly) {
+                Show-BackupCompleteNotification -BackupName $BACKUP_NAME_BASE -PartCount $localBackupPaths.Count -TotalSize $totalSizeDisplay -Duration $durationDisplay -LocalOnly $true -BackupDirectory $LOCAL_BACKUP_DIR
+            }
+            else {
+                Show-BackupCompleteNotification -BackupName $BACKUP_NAME_BASE -PartCount $localBackupPaths.Count -TotalSize $totalSizeDisplay -Duration $durationDisplay
+            }
         }
     }
     catch {
@@ -3042,6 +3260,19 @@ function Invoke-Backup {
         
         Write-Log "Backup Base Name: $BACKUP_NAME_BASE" -Level Info
         Write-Log "Total Parts: $partCount" -Level Info
+        if ($LocalOnly) {
+            Write-Log "Mode: LOCAL-ONLY (no cloud upload)" -Level Info
+            Write-Log "Backup Location: $LOCAL_BACKUP_DIR" -Level Info
+            if ($null -ne $localBackupPaths -and $localBackupPaths.Count -gt 0) {
+                Write-Log "Backup Files:" -Level Info
+                foreach ($partPath in $localBackupPaths) {
+                    if (Test-Path $partPath) {
+                        $partName = Split-Path -Leaf $partPath
+                        Write-Log "  - $partName" -Level Info
+                    }
+                }
+            }
+        }
         Write-Log "Status: $(if ($backupSuccess) { 'SUCCESS' } else { 'FAILED' })" -Level $(if ($backupSuccess) { 'Success' } else { 'Error' })
         Write-Log "Total Duration: $($totalDuration.TotalSeconds.ToString('F2'))s ($($totalDuration.ToString('hh\:mm\:ss')))" -Level Info
         Write-Log "Ended: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level Info
@@ -3169,10 +3400,11 @@ try {
             Write-Host "  [3] Run in dry-run mode" -ForegroundColor White
             Write-Host "  [4] Manage schedule" -ForegroundColor White
             Write-Host "  [5] Delete configuration (start fresh)" -ForegroundColor White
+            Write-Host "  [6] Run backup locally only (choose save location)" -ForegroundColor White
             Write-Host "  [Q] Quit" -ForegroundColor White
             Write-Host ""
             
-            $choice = Read-UserChoice -Prompt "Choice" -ValidChoices @('1', '2', '3', '4', '5', 'Q', '') -DefaultChoice '1'
+            $choice = Read-UserChoice -Prompt "Choice" -ValidChoices @('1', '2', '3', '4', '5', '6', 'Q', '') -DefaultChoice '1'
             
             switch ($choice) {
                 '2' {
@@ -3218,6 +3450,32 @@ try {
                     else {
                         Write-Host ""
                         Read-Host "Press Enter to continue"
+                        exit 0
+                    }
+                }
+                '6' {
+                    # Local-only backup with custom path
+                    Write-Host ""
+                    Write-ColorMessage "Local-Only Backup Mode" -Type Info
+                    Write-ColorMessage "Backup files will be saved locally without uploading to Google Drive." -Type Info
+                    Write-Host ""
+                    
+                    # Prompt for backup directory
+                    $customBackupDir = Read-BackupDirectory
+                    
+                    if (-not [string]::IsNullOrEmpty($customBackupDir)) {
+                        # Override the script-level LOCAL_BACKUP_DIR variable
+                        Set-Variable -Name LOCAL_BACKUP_DIR -Value $customBackupDir -Scope Script
+                        Write-Host ""
+                        Write-ColorMessage "Backup directory set to: $customBackupDir" -Type Success
+                        Write-Host ""
+                        
+                        # Set LocalOnly flag
+                        $script:LocalOnly = $true
+                        Invoke-Backup
+                    }
+                    else {
+                        Write-ColorMessage "Backup cancelled - no directory selected." -Type Warning
                         exit 0
                     }
                 }
