@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Automated website backup script with SSH, rclone, and cloud storage integration (Google Drive or OneDrive).
+    Automated website backup script with SSH, rclone, and Google Drive integration.
 
 .DESCRIPTION
     This script performs automated backups of a remote website by:
     1. Connecting to remote server via SSH (key authentication)
     2. Creating compressed tar.gz archive on remote server
     3. Downloading archive to local machine
-    4. Uploading to Google Drive or OneDrive via rclone
+    4. Uploading to Google Drive via rclone
     5. Rotating backups (keeping last 7)
     6. Cleaning up temporary files
 
@@ -24,10 +24,7 @@
     Path to website files on remote server (e.g., /var/www/html).
 
 .PARAMETER GDriveRemote
-    Google Drive destination path (e.g., gdrive:backups/website). Deprecated - use UploadTarget instead.
-
-.PARAMETER UploadTarget
-    Cloud storage service to use: "gdrive" for Google Drive or "onedrive" for OneDrive.
+    Google Drive destination path (e.g., gdrive:backups/website).
 
 .PARAMETER DryRun
     If specified, simulates the backup process without making actual changes.
@@ -44,18 +41,14 @@
     Simulates the backup process without making changes.
 
 .EXAMPLE
-    .\Backup-Website.ps1 -SSHUser admin -SSHHost example.com -RemotePath /var/www/html -UploadTarget "gdrive"
-    Runs backup with specified parameters using Google Drive.
-
-.EXAMPLE
-    .\Backup-Website.ps1 -SSHUser admin -SSHHost example.com -RemotePath /var/www/html -UploadTarget "onedrive"
-    Runs backup with specified parameters using OneDrive.
+    .\Backup-Website.ps1 -SSHUser admin -SSHHost example.com -RemotePath /var/www/html -GDriveRemote "gdrive:backups/website"
+    Runs backup with specified parameters.
 
 .NOTES
     Requirements:
     - OpenSSH client installed and in PATH
     - SSH key configured for passwordless authentication
-    - Rclone installed and configured with Google Drive or OneDrive remote
+    - Rclone installed and configured with Google Drive remote
     - Run Setup-BackupCredentials.ps1 first for initial setup
 
     Script built with love by Soulitek
@@ -83,10 +76,6 @@ param(
     
     [Parameter(Mandatory=$false)]
     [string]$GDriveRemote,
-    
-    [Parameter(Mandatory=$false)]
-    [ValidateSet('gdrive', 'onedrive')]
-    [string]$UploadTarget,
     
     [Parameter(Mandatory=$false)]
     [switch]$DryRun,
@@ -372,16 +361,8 @@ function Show-Configuration {
     Write-Host "$($Config.SSHUser)@$($Config.SSHHost):$($Config.SSHPort)" -ForegroundColor Yellow
     Write-Host "  Website Path:     " -NoNewline -ForegroundColor Gray
     Write-Host "$($Config.RemotePath)" -ForegroundColor Yellow
-    
-    # Handle backward compatibility - check if UploadTarget exists
-    $uploadTarget = if ($Config.PSObject.Properties.Name -contains "UploadTarget") { $Config.UploadTarget } else { "gdrive" }
-    $cloudRemote = if ($Config.PSObject.Properties.Name -contains "CloudRemote") { $Config.CloudRemote } else { $Config.GDriveRemote }
-    
-    $serviceName = if ($uploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
-    Write-Host "  Cloud Storage:    " -NoNewline -ForegroundColor Gray
-    Write-Host "$serviceName" -ForegroundColor Yellow
-    Write-Host "  Remote Path:      " -NoNewline -ForegroundColor Gray
-    Write-Host "$cloudRemote" -ForegroundColor Yellow
+    Write-Host "  Google Drive:     " -NoNewline -ForegroundColor Gray
+    Write-Host "$($Config.GDriveRemote)" -ForegroundColor Yellow
     Write-Host "  Backup Retention: " -NoNewline -ForegroundColor Gray
     Write-Host "Keep last $BACKUP_RETENTION_COUNT backups" -ForegroundColor Yellow
     if ($Config.ScheduleFrequency -and $Config.ScheduleTime) {
@@ -1434,35 +1415,12 @@ function Invoke-InteractiveSetup {
     
     Start-Sleep -Seconds 1
     
-    # STEP 5: Cloud Storage Setup
-    Show-ProgressStep -Step 5 -TotalSteps 8 -Description "Cloud Storage Configuration"
+    # STEP 5: Google Drive Setup
+    Show-ProgressStep -Step 5 -TotalSteps 8 -Description "Google Drive Configuration"
     
-    Write-Host ""
-    Write-ColorMessage "Which cloud storage service would you like to use?" -Type Question
-    Write-Host ""
-    Write-Host "  [1] Google Drive (default)" -ForegroundColor White
-    Write-Host "  [2] OneDrive" -ForegroundColor White
-    Write-Host ""
-    
-    $storageChoice = Read-UserInput -Prompt "Select option (1-2)" -DefaultValue "1"
-    
-    $uploadTarget = "gdrive"
-    $remoteName = "gdrive"
-    $serviceName = "Google Drive"
-    $remotePath = "gdrive:backups/website"
-    
-    if ($storageChoice -eq "2") {
-        $uploadTarget = "onedrive"
-        $remoteName = "onedrive"
-        $serviceName = "OneDrive"
-        $remotePath = "onedrive:backups/website"
-    }
-    
-    Write-Host ""
-    Write-ColorMessage "Selected: $serviceName" -Type Info
     Write-ColorMessage "Checking rclone configuration..." -Type Info
     
-    # Check if remote exists
+    # Check if gdrive remote exists
     $process = Start-Process -FilePath "rclone" -ArgumentList "listremotes" `
         -Wait -NoNewWindow -PassThru -RedirectStandardOutput "remotes.tmp"
     
@@ -1472,43 +1430,36 @@ function Invoke-InteractiveSetup {
         Remove-Item "remotes.tmp" -ErrorAction SilentlyContinue
     }
     
-    $remoteExists = $remotes -contains "${remoteName}:"
+    $gdriveExists = $remotes -contains "gdrive:"
     
-    if ($remoteExists) {
-        Write-ColorMessage "[OK] $serviceName remote '$remoteName' already configured!" -Type Success
+    if ($gdriveExists) {
+        Write-ColorMessage "[OK] Google Drive remote 'gdrive' already configured!" -Type Success
     }
     else {
         Write-Host ""
-        Write-ColorMessage "$serviceName remote '$remoteName' not found." -Type Warning
+        Write-ColorMessage "Google Drive remote 'gdrive' not found." -Type Warning
         Write-ColorMessage "I'll launch rclone config to help you set it up." -Type Info
         Write-Host ""
         Write-ColorMessage "Follow these steps in rclone config:" -Type Info
         Write-ColorMessage "  1. Type 'n' for new remote" -Type Info
-        Write-ColorMessage "  2. Enter name: $remoteName" -Type Info
-        if ($uploadTarget -eq "gdrive") {
-            Write-ColorMessage "  3. Select 'Google Drive' from the list" -Type Info
-            Write-ColorMessage "  4. Leave client_id and client_secret blank (press Enter)" -Type Info
-            Write-ColorMessage "  5. Choose scope: 1 (Full access)" -Type Info
-            Write-ColorMessage "  6. Follow the browser authentication" -Type Info
-        } else {
-            Write-ColorMessage "  3. Select 'Microsoft OneDrive' from the list" -Type Info
-            Write-ColorMessage "  4. Leave client_id and client_secret blank (press Enter)" -Type Info
-            Write-ColorMessage "  5. Choose 'onedrive' (not 'sharepoint')" -Type Info
-            Write-ColorMessage "  6. Follow the browser authentication" -Type Info
-        }
+        Write-ColorMessage "  2. Enter name: gdrive" -Type Info
+        Write-ColorMessage "  3. Select 'Google Drive' from the list" -Type Info
+        Write-ColorMessage "  4. Leave client_id and client_secret blank (press Enter)" -Type Info
+        Write-ColorMessage "  5. Choose scope: 1 (Full access)" -Type Info
+        Write-ColorMessage "  6. Follow the browser authentication" -Type Info
         Write-ColorMessage "  7. Type 'q' to quit when done" -Type Info
         Write-Host ""
         
         $proceed = Read-UserChoice -Prompt "Ready to launch rclone config?" -ValidChoices @('Y', 'N') -DefaultChoice 'Y'
         if ($proceed -ne 'Y') {
-            Write-ColorMessage "Cannot continue without $serviceName configuration." -Type Error
+            Write-ColorMessage "Cannot continue without Google Drive configuration." -Type Error
             return $null
         }
         
         # Launch rclone config
         Start-Process -FilePath "rclone" -ArgumentList "config" -Wait -NoNewWindow
         
-        # Verify remote was created
+        # Verify gdrive was created
         $process = Start-Process -FilePath "rclone" -ArgumentList "listremotes" `
             -Wait -NoNewWindow -PassThru -RedirectStandardOutput "remotes.tmp"
         
@@ -1518,26 +1469,26 @@ function Invoke-InteractiveSetup {
             Remove-Item "remotes.tmp" -ErrorAction SilentlyContinue
         }
         
-        $remoteExists = $remotes -contains "${remoteName}:"
+        $gdriveExists = $remotes -contains "gdrive:"
         
-        if (-not $remoteExists) {
-            Write-ColorMessage "[X] $serviceName remote '$remoteName' was not found. Please run rclone config manually." -Type Error
+        if (-not $gdriveExists) {
+            Write-ColorMessage "[X] Google Drive remote 'gdrive' was not found. Please run rclone config manually." -Type Error
             return $null
         }
         
-        Write-ColorMessage "[OK] $serviceName configured successfully!" -Type Success
+        Write-ColorMessage "[OK] Google Drive configured successfully!" -Type Success
     }
     
     # Create backup directories
     Write-Host ""
-    Write-ColorMessage "Creating backup directories on $serviceName..." -Type Info
+    Write-ColorMessage "Creating backup directories on Google Drive..." -Type Info
     
-    $null = Start-Process -FilePath "rclone" -ArgumentList "mkdir", "$remoteName:backups" -Wait -NoNewWindow -PassThru
-    $null = Start-Process -FilePath "rclone" -ArgumentList "mkdir", "$remotePath" -Wait -NoNewWindow -PassThru
+    $null = Start-Process -FilePath "rclone" -ArgumentList "mkdir", "gdrive:backups" -Wait -NoNewWindow -PassThru
+    $null = Start-Process -FilePath "rclone" -ArgumentList "mkdir", "gdrive:backups/website" -Wait -NoNewWindow -PassThru
     
     Write-ColorMessage "[OK] Backup directories created!" -Type Success
     
-    $cloudRemote = $remotePath
+    $gdriveRemote = "gdrive:backups/website"
     
     Start-Sleep -Seconds 1
     
@@ -1602,9 +1553,7 @@ function Invoke-InteractiveSetup {
         SSHHost = $sshHost
         SSHPort = $sshPort
         RemotePath = $remotePath
-        UploadTarget = $uploadTarget
-        CloudRemote = $cloudRemote
-        GDriveRemote = $cloudRemote  # Keep for backward compatibility
+        GDriveRemote = $gdriveRemote
     }
     
     Write-Host ""
@@ -1616,10 +1565,8 @@ function Invoke-InteractiveSetup {
     Write-Host "$remotePath" -ForegroundColor Yellow
     Write-Host "  Backup Path:   " -NoNewline -ForegroundColor Gray
     Write-Host "$remotePath/local_backups/backup.tgz" -ForegroundColor Yellow
-    Write-Host "  Cloud Storage: " -NoNewline -ForegroundColor Gray
-    Write-Host "$serviceName" -ForegroundColor Yellow
-    Write-Host "  Remote Path:   " -NoNewline -ForegroundColor Gray
-    Write-Host "$cloudRemote" -ForegroundColor Yellow
+    Write-Host "  Google Drive:  " -NoNewline -ForegroundColor Gray
+    Write-Host "$gdriveRemote" -ForegroundColor Yellow
     Write-Host ("=" * 80) -ForegroundColor DarkGray
     Write-Host ""
     
@@ -1639,9 +1586,7 @@ function Invoke-InteractiveSetup {
         Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "SSHHost" -Value $sshHost
         Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "SSHPort" -Value $sshPort
         Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "RemotePath" -Value $remotePath
-        Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "UploadTarget" -Value $uploadTarget
-        Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "CloudRemote" -Value $cloudRemote
-        Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "GDriveRemote" -Value $cloudRemote  # Backward compatibility
+        Set-ItemProperty -Path "HKCU:\Software\WebsiteBackup" -Name "GDriveRemote" -Value $gdriveRemote
         
         Write-ColorMessage "[OK] Configuration saved successfully!" -Type Success
     }
@@ -1804,13 +1749,11 @@ function Get-StoredCredentials {
         
         # Build configuration object
         $config = @{
-            SSHUser = $SSHUser
-            SSHHost = $SSHHost
-            SSHPort = $SSHPort
-            RemotePath = $RemotePath
-            GDriveRemote = $GDriveRemote
-            UploadTarget = $UploadTarget
-            CloudRemote = $null
+            SSHUser = $script:SSHUser
+            SSHHost = $script:SSHHost
+            SSHPort = $script:SSHPort
+            RemotePath = $script:RemotePath
+            GDriveRemote = $script:GDriveRemote
             ScheduleFrequency = $null
             ScheduleTime = $null
         }
@@ -1827,65 +1770,19 @@ function Get-StoredCredentials {
                     if ([string]::IsNullOrEmpty($config.SSHHost)) { $config.SSHHost = $regConfig.SSHHost }
                     if ([string]::IsNullOrEmpty($config.RemotePath)) { $config.RemotePath = $regConfig.RemotePath }
                     if ([string]::IsNullOrEmpty($config.GDriveRemote)) { $config.GDriveRemote = $regConfig.GDriveRemote }
-                    # Load UploadTarget if available
-                    if ($regConfig.UploadTarget) { $config.UploadTarget = $regConfig.UploadTarget }
-                    # Load CloudRemote if available
-                    if ($regConfig.CloudRemote) { $config.CloudRemote = $regConfig.CloudRemote }
                     # Load schedule information if available
                     if ($regConfig.ScheduleFrequency) { $config.ScheduleFrequency = $regConfig.ScheduleFrequency }
                     if ($regConfig.ScheduleTime) { $config.ScheduleTime = $regConfig.ScheduleTime }
                 }
             }
         } else {
-            # Even if credentials are provided as parameters, still try to load schedule and UploadTarget from registry
+            # Even if credentials are provided as parameters, still try to load schedule from registry
             $regPath = "HKCU:\Software\WebsiteBackup"
             if (Test-Path $regPath) {
                 $regConfig = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
                 if ($regConfig) {
-                    if ([string]::IsNullOrEmpty($config.UploadTarget) -and $regConfig.UploadTarget) { 
-                        $config.UploadTarget = $regConfig.UploadTarget 
-                    }
-                    if ([string]::IsNullOrEmpty($config.CloudRemote) -and $regConfig.CloudRemote) { 
-                        $config.CloudRemote = $regConfig.CloudRemote 
-                    }
                     if ($regConfig.ScheduleFrequency) { $config.ScheduleFrequency = $regConfig.ScheduleFrequency }
                     if ($regConfig.ScheduleTime) { $config.ScheduleTime = $regConfig.ScheduleTime }
-                }
-            }
-        }
-        
-        # Determine UploadTarget and CloudRemote with backward compatibility
-        if ([string]::IsNullOrEmpty($config.UploadTarget)) {
-            # Backward compatibility: if GDriveRemote exists, default to gdrive
-            if (-not [string]::IsNullOrEmpty($config.GDriveRemote)) {
-                $config.UploadTarget = "gdrive"
-                Write-Log "UploadTarget not specified, defaulting to 'gdrive' for backward compatibility" -Level Info
-            } else {
-                $config.UploadTarget = "gdrive"  # Default fallback
-            }
-        }
-        
-        # Derive CloudRemote based on UploadTarget
-        if ([string]::IsNullOrEmpty($config.CloudRemote)) {
-            if ($config.UploadTarget -eq "onedrive") {
-                # Check if OneDriveRemote exists in registry, otherwise construct default
-                $regPath = "HKCU:\Software\WebsiteBackup"
-                if (Test-Path $regPath) {
-                    $regConfig = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
-                    if ($regConfig -and $regConfig.OneDriveRemote) {
-                        $config.CloudRemote = $regConfig.OneDriveRemote
-                    } else {
-                        $config.CloudRemote = "onedrive:backups/website"
-                    }
-                } else {
-                    $config.CloudRemote = "onedrive:backups/website"
-                }
-            } else {
-                # Default to gdrive
-                if ([string]::IsNullOrEmpty($config.GDriveRemote)) {
-                    $config.CloudRemote = "gdrive:backups/website"
-                } else {
-                    $config.CloudRemote = $config.GDriveRemote
                 }
             }
         }
@@ -1900,16 +1797,15 @@ function Get-StoredCredentials {
         if ([string]::IsNullOrEmpty($config.RemotePath)) {
             throw "Remote Path not configured. Run Setup-BackupCredentials.ps1 or provide -RemotePath parameter."
         }
-        if ([string]::IsNullOrEmpty($config.CloudRemote)) {
-            throw "Cloud Storage Remote not configured. Run Setup-BackupCredentials.ps1 or provide -UploadTarget parameter."
+        if ([string]::IsNullOrEmpty($config.GDriveRemote)) {
+            throw "Google Drive Remote not configured. Run Setup-BackupCredentials.ps1 or provide -GDriveRemote parameter."
         }
         
         Write-Log "SSH User: $($config.SSHUser)" -Level Info
         Write-Log "SSH Host: $($config.SSHHost)" -Level Info
         Write-Log "SSH Port: $($config.SSHPort)" -Level Info
         Write-Log "Remote Path: $($config.RemotePath)" -Level Info
-        Write-Log "Upload Target: $($config.UploadTarget)" -Level Info
-        Write-Log "Cloud Remote: $($config.CloudRemote)" -Level Info
+        Write-Log "Google Drive Remote: $($config.GDriveRemote)" -Level Info
         Write-Log "Configuration loaded successfully" -Level Success
         
         return $config
@@ -2413,10 +2309,10 @@ function Get-BackupArchive {
     }
 }
 
-function Publish-ToCloudStorage {
+function Publish-ToGoogleDrive {
     <#
     .SYNOPSIS
-        Uploads the backup archive parts to cloud storage (Google Drive or OneDrive) using rclone with checksum verification.
+        Uploads the backup archive parts to Google Drive using rclone with checksum verification.
     #>
     [CmdletBinding()]
     param(
@@ -2430,20 +2326,14 @@ function Publish-ToCloudStorage {
         [hashtable]$Checksums
     )
     
-    # Handle backward compatibility
-    $uploadTarget = if ($Config.PSObject.Properties.Name -contains "UploadTarget") { $Config.UploadTarget } else { "gdrive" }
-    $cloudRemote = if ($Config.PSObject.Properties.Name -contains "CloudRemote") { $Config.CloudRemote } else { $Config.GDriveRemote }
-    $serviceName = if ($uploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
-    
-    Write-StepHeader "Uploading to $serviceName"
+    Write-StepHeader "Uploading to Google Drive"
     
     $stepStart = Get-Date
     
     try {
         $totalParts = $LocalPaths.Count
         Write-Log "Total parts to upload: $totalParts" -Level Info
-        Write-Log "Destination remote: $cloudRemote" -Level Info
-        Write-Log "Upload target: $serviceName" -Level Info
+        Write-Log "Destination remote: $($Config.GDriveRemote)" -Level Info
         
         # Calculate total size across all parts
         $totalSizeBytes = 0
@@ -2458,7 +2348,7 @@ function Publish-ToCloudStorage {
         Write-Log "Total size to upload: $totalSizeDisplay ($totalSizeBytes bytes)" -Level Info
         
         if ($DryRun) {
-            Write-Log "[DRY RUN] Would upload $totalParts parts to $serviceName" -Level Warning
+            Write-Log "[DRY RUN] Would upload $totalParts parts to Google Drive" -Level Warning
             return $true
         }
         
@@ -2467,7 +2357,7 @@ function Publish-ToCloudStorage {
         Write-Log "Estimated total upload time: ~$estimatedMinutes minutes (depends on connection speed)" -Level Info
         
         Write-Host ""
-        Write-Host "  Starting $serviceName upload..." -ForegroundColor Cyan
+        Write-Host "  Starting Google Drive upload..." -ForegroundColor Cyan
         Write-Host "  Total parts: $totalParts" -ForegroundColor Cyan
         Write-Host "  Total size: $totalSizeDisplay" -ForegroundColor Cyan
         Write-Host ""
@@ -2506,7 +2396,7 @@ function Publish-ToCloudStorage {
             }
             
             # Upload using rclone with checksum verification, progress and retry logic
-            $rcloneCommand = "rclone copy `"$partPath`" `"$cloudRemote`" --checksum --progress --stats 5s --verbose"
+            $rcloneCommand = "rclone copy `"$partPath`" `"$($Config.GDriveRemote)`" --checksum --progress --stats 5s --verbose"
             Write-Log "Command: $rcloneCommand" -Level Info
             
             $maxRetries = 3
@@ -2528,7 +2418,7 @@ function Publish-ToCloudStorage {
                     $stderr = $null
                     
                     $process = Start-Process -FilePath "rclone" `
-                        -ArgumentList @("copy", "`"$partPath`"", "`"$cloudRemote`"", "--checksum", "--progress", "--stats", "5s", "--verbose") `
+                        -ArgumentList @("copy", "`"$partPath`"", "`"$($Config.GDriveRemote)`"", "--checksum", "--progress", "--stats", "5s", "--verbose") `
                         -Wait -NoNewWindow -PassThru `
                         -RedirectStandardOutput "rclone_stdout_$uploadedParts.tmp" `
                         -RedirectStandardError "rclone_stderr_$uploadedParts.tmp"
@@ -2606,7 +2496,7 @@ function Publish-ToCloudStorage {
             }
             
             if (-not $uploadSuccess) {
-                $errorMsg = "Failed to upload part $uploadedParts ($partName) to $serviceName after $maxRetries attempt(s). $lastError"
+                $errorMsg = "Failed to upload part $uploadedParts ($partName) to Google Drive after $maxRetries attempt(s). $lastError"
                 Write-Log $errorMsg -Level Error
                 Write-Host "  ERROR: Upload failed for part $uploadedParts" -ForegroundColor Red
                 throw $errorMsg
@@ -2617,10 +2507,10 @@ function Publish-ToCloudStorage {
             
             # Verify this part using rclone check (checksum verification)
             if ($partChecksum) {
-                Write-Log "Verifying part $uploadedParts integrity on $serviceName using checksum..." -Level Info
+                Write-Log "Verifying part $uploadedParts integrity on Google Drive using checksum..." -Level Info
                 try {
                     $checkProcess = Start-Process -FilePath "rclone" `
-                        -ArgumentList @("check", "`"$partPath`"", "`"$cloudRemote/$partName`"", "--checksum", "--one-way") `
+                        -ArgumentList @("check", "`"$partPath`"", "`"$($Config.GDriveRemote)/$partName`"", "--checksum", "--one-way") `
                         -Wait -NoNewWindow -PassThru `
                         -RedirectStandardOutput "rclone_check_stdout_$uploadedParts.tmp" `
                         -RedirectStandardError "rclone_check_stderr_$uploadedParts.tmp"
@@ -2659,7 +2549,7 @@ function Publish-ToCloudStorage {
                 Write-Log "WARNING: No checksum available for part $uploadedParts - skipping checksum verification" -Level Warning
                 # Fallback to size verification
                 Write-Log "Performing size verification for part $uploadedParts..." -Level Info
-                $verifyCommand = "rclone ls `"$cloudRemote/$partName`""
+                $verifyCommand = "rclone ls `"$($Config.GDriveRemote)/$partName`""
                 $verifyResult = Invoke-Expression $verifyCommand 2>&1
                 
                 if ($LASTEXITCODE -ne 0) {
@@ -2726,13 +2616,13 @@ function Publish-ToCloudStorage {
             Write-Log "Checksum manifest created: $manifestPath" -Level Info
             
             # Upload manifest file
-            Write-Log "Uploading checksum manifest to $serviceName..." -Level Info
+            Write-Log "Uploading checksum manifest to Google Drive..." -Level Info
             try {
                 $manifestProcess = Start-Process -FilePath "rclone" `
-                    -ArgumentList @("copy", "`"$manifestPath`"", "`"$cloudRemote`"", "--checksum") `
-                        -Wait -NoNewWindow -PassThru `
-                        -RedirectStandardOutput "rclone_manifest_stdout.tmp" `
-                        -RedirectStandardError "rclone_manifest_stderr.tmp"
+                    -ArgumentList @("copy", "`"$manifestPath`"", "`"$($Config.GDriveRemote)`"", "--checksum") `
+                    -Wait -NoNewWindow -PassThru `
+                    -RedirectStandardOutput "rclone_manifest_stdout.tmp" `
+                    -RedirectStandardError "rclone_manifest_stderr.tmp"
                 
                 $manifestExitCode = $manifestProcess.ExitCode
                 
@@ -2763,7 +2653,7 @@ function Publish-ToCloudStorage {
         if ($_.Exception.InnerException) {
             $errorDetails += " | Inner: $($_.Exception.InnerException.Message)"
         }
-        Write-Log "Failed to upload to $serviceName after $($duration.TotalSeconds.ToString('F2'))s" -Level Error
+        Write-Log "Failed to upload to Google Drive after $($duration.TotalSeconds.ToString('F2'))s" -Level Error
         Write-Log "Error details: $errorDetails" -Level Error
         Write-Log "Error at: $($_.InvocationInfo.ScriptLineNumber):$($_.InvocationInfo.PositionMessage)" -Level Error
         if ($_.ScriptStackTrace) {
@@ -2776,7 +2666,7 @@ function Publish-ToCloudStorage {
 function Remove-OldBackups {
     <#
     .SYNOPSIS
-        Removes old backups from cloud storage, keeping only the last N backups.
+        Removes old backups from Google Drive, keeping only the last N backups.
     #>
     [CmdletBinding()]
     param(
@@ -2787,18 +2677,12 @@ function Remove-OldBackups {
         [int]$KeepCount = $BACKUP_RETENTION_COUNT
     )
     
-    # Handle backward compatibility
-    $uploadTarget = if ($Config.PSObject.Properties.Name -contains "UploadTarget") { $Config.UploadTarget } else { "gdrive" }
-    $cloudRemote = if ($Config.PSObject.Properties.Name -contains "CloudRemote") { $Config.CloudRemote } else { $Config.GDriveRemote }
-    $serviceName = if ($uploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
-    
     Write-StepHeader "Rotating Old Backups"
     
     $stepStart = Get-Date
     
     try {
         Write-Log "Checking for old backups (keeping last $KeepCount backup sets)..." -Level Info
-        Write-Log "Cloud storage: $serviceName ($cloudRemote)" -Level Info
         
         if ($DryRun) {
             Write-Log "[DRY RUN] Would remove old backups" -Level Warning
@@ -2806,7 +2690,7 @@ function Remove-OldBackups {
         }
         
         # List all backup files (including split parts)
-        $listCommand = "rclone lsf `"$cloudRemote`" --files-only"
+        $listCommand = "rclone lsf `"$($Config.GDriveRemote)`" --files-only"
         Write-Log "Executing: $listCommand" -Level Info
         
         # Match both single files and split parts: website-YYYYMMDD-HHMMSS.tar.gz or website-YYYYMMDD-HHMMSS.partNNN.tar.gz
@@ -2818,7 +2702,7 @@ function Remove-OldBackups {
         }
         
         $totalFiles = ($allFiles | Measure-Object).Count
-        Write-Log "Found $totalFiles backup file(s) on $serviceName" -Level Info
+        Write-Log "Found $totalFiles backup file(s) on Google Drive" -Level Info
         
         # Group files by their base timestamp (website-YYYYMMDD-HHMMSS)
         $backupSets = @{}
@@ -2859,7 +2743,7 @@ function Remove-OldBackups {
             
             foreach ($file in $filesToDelete) {
                 Write-Log "  Deleting: $file" -Level Info
-                $deleteCommand = "rclone delete `"$cloudRemote/$file`""
+                $deleteCommand = "rclone delete `"$($Config.GDriveRemote)/$file`""
                 $result = Invoke-Expression $deleteCommand 2>&1
                 
                 if ($LASTEXITCODE -eq 0) {
@@ -3018,7 +2902,7 @@ Parts: $PartCount
 Total Size: $TotalSize
 Duration: $Duration
 
-All files have been uploaded to cloud storage.
+All files have been uploaded to Google Drive.
 "@
         
         $title = "Website Backup - Complete"
@@ -3105,18 +2989,10 @@ function Invoke-Backup {
         
         Write-Log "Backup created: $($localBackupPaths.Count) part(s)" -Level Info
         
-        # Upload all parts to cloud storage with checksums
+        # Upload all parts to Google Drive with checksums
         $checksums = if ($script:backupChecksums) { $script:backupChecksums } else { $null }
-        # Ensure config has UploadTarget and CloudRemote (backward compatibility)
-        if (-not ($config.PSObject.Properties.Name -contains "UploadTarget")) {
-            $config.UploadTarget = "gdrive"
-        }
-        if (-not ($config.PSObject.Properties.Name -contains "CloudRemote")) {
-            $config.CloudRemote = $config.GDriveRemote
-        }
-        $serviceName = if ($config.UploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
-        if (-not (Publish-ToCloudStorage -LocalPaths $localBackupPaths -Config $config -Checksums $checksums)) {
-            throw "Failed to upload to $serviceName"
+        if (-not (Publish-ToGoogleDrive -LocalPaths $localBackupPaths -Config $config -Checksums $checksums)) {
+            throw "Failed to upload to Google Drive"
         }
         
         # Calculate total size for notification
@@ -3273,8 +3149,7 @@ try {
         $SSHHost = $setupConfig.SSHHost
         $SSHPort = $setupConfig.SSHPort
         $RemotePath = $setupConfig.RemotePath
-        $UploadTarget = $setupConfig.UploadTarget
-        $GDriveRemote = $setupConfig.CloudRemote  # For backward compatibility
+        $GDriveRemote = $setupConfig.GDriveRemote
         
         # Proceed to backup
         Invoke-Backup
@@ -3314,8 +3189,7 @@ try {
                     $SSHHost = $setupConfig.SSHHost
                     $SSHPort = $setupConfig.SSHPort
                     $RemotePath = $setupConfig.RemotePath
-                    $UploadTarget = $setupConfig.UploadTarget
-                    $GDriveRemote = $setupConfig.CloudRemote  # For backward compatibility
+                    $GDriveRemote = $setupConfig.GDriveRemote
                     
                     # Proceed to backup
                     Invoke-Backup
