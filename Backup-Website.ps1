@@ -372,11 +372,16 @@ function Show-Configuration {
     Write-Host "$($Config.SSHUser)@$($Config.SSHHost):$($Config.SSHPort)" -ForegroundColor Yellow
     Write-Host "  Website Path:     " -NoNewline -ForegroundColor Gray
     Write-Host "$($Config.RemotePath)" -ForegroundColor Yellow
-    $serviceName = if ($Config.UploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
+    
+    # Handle backward compatibility - check if UploadTarget exists
+    $uploadTarget = if ($Config.PSObject.Properties.Name -contains "UploadTarget") { $Config.UploadTarget } else { "gdrive" }
+    $cloudRemote = if ($Config.PSObject.Properties.Name -contains "CloudRemote") { $Config.CloudRemote } else { $Config.GDriveRemote }
+    
+    $serviceName = if ($uploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
     Write-Host "  Cloud Storage:    " -NoNewline -ForegroundColor Gray
     Write-Host "$serviceName" -ForegroundColor Yellow
     Write-Host "  Remote Path:      " -NoNewline -ForegroundColor Gray
-    Write-Host "$($Config.CloudRemote)" -ForegroundColor Yellow
+    Write-Host "$cloudRemote" -ForegroundColor Yellow
     Write-Host "  Backup Retention: " -NoNewline -ForegroundColor Gray
     Write-Host "Keep last $BACKUP_RETENTION_COUNT backups" -ForegroundColor Yellow
     if ($Config.ScheduleFrequency -and $Config.ScheduleTime) {
@@ -2425,8 +2430,9 @@ function Publish-ToCloudStorage {
         [hashtable]$Checksums
     )
     
-    $uploadTarget = $Config.UploadTarget
-    $cloudRemote = $Config.CloudRemote
+    # Handle backward compatibility
+    $uploadTarget = if ($Config.PSObject.Properties.Name -contains "UploadTarget") { $Config.UploadTarget } else { "gdrive" }
+    $cloudRemote = if ($Config.PSObject.Properties.Name -contains "CloudRemote") { $Config.CloudRemote } else { $Config.GDriveRemote }
     $serviceName = if ($uploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
     
     Write-StepHeader "Uploading to $serviceName"
@@ -2781,8 +2787,9 @@ function Remove-OldBackups {
         [int]$KeepCount = $BACKUP_RETENTION_COUNT
     )
     
-    $cloudRemote = $Config.CloudRemote
-    $uploadTarget = $Config.UploadTarget
+    # Handle backward compatibility
+    $uploadTarget = if ($Config.PSObject.Properties.Name -contains "UploadTarget") { $Config.UploadTarget } else { "gdrive" }
+    $cloudRemote = if ($Config.PSObject.Properties.Name -contains "CloudRemote") { $Config.CloudRemote } else { $Config.GDriveRemote }
     $serviceName = if ($uploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
     
     Write-StepHeader "Rotating Old Backups"
@@ -3100,6 +3107,13 @@ function Invoke-Backup {
         
         # Upload all parts to cloud storage with checksums
         $checksums = if ($script:backupChecksums) { $script:backupChecksums } else { $null }
+        # Ensure config has UploadTarget and CloudRemote (backward compatibility)
+        if (-not ($config.PSObject.Properties.Name -contains "UploadTarget")) {
+            $config.UploadTarget = "gdrive"
+        }
+        if (-not ($config.PSObject.Properties.Name -contains "CloudRemote")) {
+            $config.CloudRemote = $config.GDriveRemote
+        }
         $serviceName = if ($config.UploadTarget -eq "onedrive") { "OneDrive" } else { "Google Drive" }
         if (-not (Publish-ToCloudStorage -LocalPaths $localBackupPaths -Config $config -Checksums $checksums)) {
             throw "Failed to upload to $serviceName"
